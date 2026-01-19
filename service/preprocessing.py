@@ -58,6 +58,50 @@ def extract_text_from_colored_bg(img: np.ndarray) -> np.ndarray:
     return result
 
 
+def extract_white_text_from_red_bg_advanced(img: np.ndarray) -> np.ndarray:
+    """
+    Pipeline optimizado específicamente para texto BLANCO sobre fondo ROJO borroso.
+    Combina extracción de luminosidad LAB + eliminación de rojo HSV.
+    
+    Este es el método más efectivo para tablas nutricionales rojas.
+    """
+    # Paso 1: Extraer canal L (luminosidad) del espacio LAB
+    # Esto ignora el color y se enfoca en la intensidad de luz
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    
+    # Paso 2: Aplicar CLAHE agresivo al canal L para aumentar contraste
+    clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l_channel)
+    
+    # Paso 3: Eliminar fondo rojo usando HSV como máscara adicional
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    # Rangos optimizados para rojos saturados (tablas nutricionales)
+    mask_red1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+    mask_red2 = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
+    red_mask = cv2.bitwise_or(mask_red1, mask_red2)
+    
+    # Paso 4: Aplicar la máscara al canal L mejorado
+    # Donde hay rojo (fondo), ponemos blanco
+    l_enhanced[red_mask > 0] = 255
+    
+    # Paso 5: Invertir (texto blanco -> texto negro para OCR)
+    inverted = cv2.bitwise_not(l_enhanced)
+    
+    # Paso 6: Binarización Otsu
+    _, binary = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Paso 7: Limpieza con morfología (eliminar ruido pequeño)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    
+    # Paso 8: Volver a invertir para tener texto negro sobre fondo blanco
+    result = cv2.bitwise_not(cleaned)
+    
+    logger.info("Aplicado pipeline avanzado: LAB + HSV + CLAHE + morfología")
+    return result
+
+
 def extract_text_adaptive(img: np.ndarray) -> np.ndarray:
     """Extraccion adaptativa de texto - funciona con texto claro u oscuro."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -164,6 +208,36 @@ def sharpen_image(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     """Aumenta nitidez."""
     kernel = np.array([[-1, -1, -1], [-1, 9 + strength, -1], [-1, -1, -1]])
     return cv2.filter2D(img, -1, kernel)
+
+
+def deblur_image(img: np.ndarray, method: str = 'unsharp') -> np.ndarray:
+    """
+    Reduce borrosidad de la imagen.
+    Especialmente efectivo para tablas con texto borroso.
+    
+    Args:
+        img: Imagen a procesar
+        method: 'unsharp' o 'laplacian'
+    """
+    if method == 'unsharp':
+        # Unsharp masking - muy efectivo para borrosidad
+        gaussian = cv2.GaussianBlur(img, (0, 0), 2.0)
+        unsharp = cv2.addWeighted(img, 2.0, gaussian, -1.0, 0)
+        return unsharp
+    elif method == 'laplacian':
+        # Sharpening con Laplacian
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        laplacian = np.uint8(np.absolute(laplacian))
+        if len(img.shape) == 3:
+            sharpened = cv2.addWeighted(img, 1.5, cv2.cvtColor(laplacian, cv2.COLOR_GRAY2BGR), -0.5, 0)
+        else:
+            sharpened = cv2.addWeighted(img, 1.5, laplacian, -0.5, 0)
+        return sharpened
+    return img
 
 
 def invert_if_dark(img: np.ndarray) -> np.ndarray:
@@ -333,21 +407,37 @@ def decide_conversion_strategy(analysis: dict) -> str:
         - 'black_on_white': Texto oscuro sobre fondo claro
         - 'enhance_contrast': Bajo contraste, aumentar primero
         - 'extract_luminosity': Fondo de color saturado
+        - 'red_background_advanced': Fondo rojo específicamente (MEJOR para tablas nutricionales)
         - 'invert_colors': Invertir todo
     """
     text_lum = analysis['text_luminosity']
     bg_lum = analysis['bg_luminosity']
     contrast = analysis['contrast']
 
+    # Detectar si el fondo es de color saturado
+    bg_r, bg_g, bg_b = analysis['bg_color']
+    bg_saturation = (max(bg_r, bg_g, bg_b) - min(bg_r, bg_g, bg_b)) / 255.0
+    
+    # NUEVO: Detectar específicamente fondo ROJO (tablas nutricionales)
+    # Rojo: R alto, G y B bajos
+    is_red_background = (bg_r > 150 and bg_g < 100 and bg_b < 100) or \
+                       (bg_r > bg_g + 80 and bg_r > bg_b + 80)
+    
+    # Detectar texto blanco: luminosidad alta
+    is_white_text = text_lum > 0.7
+    
+    # ESTRATEGIA PRIORITARIA: Fondo rojo + texto blanco
+    if is_red_background and is_white_text:
+        logger.info("Estrategia: red_background_advanced (fondo rojo detectado R=%d, texto blanco L=%.2f)", 
+                   bg_r, text_lum)
+        return 'red_background_advanced'
+
     # Bajo contraste: necesita mejora
     if contrast < 0.3:
         logger.info("Estrategia: enhance_contrast (contraste bajo: %.2f)", contrast)
         return 'enhance_contrast'
 
-    # Detectar si el fondo es de color saturado
-    bg_r, bg_g, bg_b = analysis['bg_color']
-    bg_saturation = (max(bg_r, bg_g, bg_b) - min(bg_r, bg_g, bg_b)) / 255.0
-
+    # Fondo de color saturado genérico
     if bg_saturation > 0.4 and contrast > 0.3:
         logger.info("Estrategia: extract_luminosity (fondo saturado: %.2f)", bg_saturation)
         return 'extract_luminosity'
@@ -378,7 +468,12 @@ def apply_smart_conversion(img: np.ndarray, strategy: str, analysis: dict) -> np
     """
     result = img.copy()
 
-    if strategy == 'enhance_contrast':
+    if strategy == 'red_background_advanced':
+        # NUEVA ESTRATEGIA: Pipeline optimizado para fondo rojo + texto blanco borroso
+        result = extract_white_text_from_red_bg_advanced(result)
+        logger.info("Aplicado: red_background_advanced (pipeline LAB+HSV optimizado)")
+
+    elif strategy == 'enhance_contrast':
         # Aumentar contraste agresivamente
         gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
         clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
@@ -476,6 +571,13 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
             scale = min(max(min_size / min(h, w), 1.5), max_scale)
             result = upscale_image(result, scale)
             applied.append(f'upscale_{scale:.1f}x')
+
+        # NUEVO: Deblurring si la imagen está borrosa
+        if options.get('deblur', False):
+            deblur_method = options.get('deblur_method', 'unsharp')
+            result = deblur_image(result, deblur_method)
+            applied.append(f'deblur_{deblur_method}')
+            logger.info("Aplicado deblurring con método: %s", deblur_method)
 
         # Detectar regiones de tabla
         regions = detect_table_regions(result)
