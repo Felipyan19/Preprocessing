@@ -38,15 +38,18 @@ Debes especificar **una** de estas opciones:
 | `white_text_on_color` | Optimizado para texto claro sobre fondos de color | Fondos azules, verdes, rojos |
 | `red_table_blurry` ⭐ | Pipeline especializado para fondo rojo + texto blanco borroso | Tablas nutricionales |
 | `smart_auto` | Detección automática inteligente | Cuando no sabes qué preset usar |
+| `small_text_sharp` ⭐⭐ | Escalado agresivo + deblur + sharpening para texto diminuto | Tablas con letra muy pequeña y pegada |
 | `minimal` | Mínimo procesamiento | Imágenes de alta calidad |
 
 ### Uso:
 ```json
 {
   "image_url": "https://...",
-  "preset": "red_table_blurry"
+  "preset": "small_text_sharp"
 }
 ```
+
+**Nota:** Para texto muy pequeño y borroso, usa `small_text_sharp` en lugar de `red_table_blurry`.
 
 ---
 
@@ -88,14 +91,22 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 | Opción | Tipo | Default | Descripción |
 |--------|------|---------|-------------|
 | `deblur` | `boolean` | `false` | Activa reducción de borrosidad |
-| `deblur_method` | `string` | `"unsharp"` | Método de deblur: `"unsharp"` o `"laplacian"` |
+| `deblur_method` | `string` | `"unsharp"` | Método de deblur: `"unsharp"`, `"laplacian"`, `"aggressive"` ⭐ |
+| `deblur_strength` | `float` | `1.0` | Intensidad del deblur (0.5-2.0) |
+
+#### Métodos de Deblur
+
+- **`unsharp`**: Balance entre calidad y velocidad (recomendado)
+- **`laplacian`**: Enfoque en bordes
+- **`aggressive`** ⭐: Deblur muy fuerte para texto MUY pequeño y pegado (mejor para tablas con letra diminuta)
 
 **Ejemplo:**
 ```json
 {
   "image_url": "https://...",
   "deblur": true,
-  "deblur_method": "unsharp"
+  "deblur_method": "aggressive",
+  "deblur_strength": 1.5
 }
 ```
 
@@ -108,14 +119,22 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 | `upscale` | `boolean` | `true` | Agranda imágenes pequeñas |
 | `min_size` | `integer` | `800` | Tamaño mínimo en píxeles |
 | `max_scale` | `float` | `3.0` | Factor máximo de escalado |
+| `upscale_method` | `string` | `"cubic"` | Método de interpolación: `"cubic"`, `"lanczos4"` ⭐, `"linear"` |
+
+#### Métodos de Upscale
+
+- **`cubic`**: Balance entre calidad y velocidad (default)
+- **`lanczos4`** ⭐: Mejor calidad para preservar detalles finos (recomendado para texto pequeño)
+- **`linear`**: Más rápido, menor calidad
 
 **Ejemplo:**
 ```json
 {
   "image_url": "https://...",
   "upscale": true,
-  "min_size": 1000,
-  "max_scale": 3.0
+  "min_size": 1500,
+  "max_scale": 5.0,
+  "upscale_method": "lanczos4"
 }
 ```
 
@@ -221,13 +240,22 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 |--------|------|---------|-------------|
 | `sharpen` | `boolean` | `false` | Aumenta la nitidez |
 | `sharpen_strength` | `float` | `1.0` | Intensidad del sharpening (0.5-3.0) |
+| `sharpen_method` | `string` | `"kernel"` | Método: `"kernel"` (rápido), `"unsharp"` (mejor calidad) |
+| `preserve_fine_details` | `boolean` | `false` | No aplicar median blur después de conversión (preserva texto pequeño) |
+
+#### Métodos de Sharpen
+
+- **`kernel`**: Sharpening tradicional con kernel (rápido)
+- **`unsharp`**: Unsharp masking (mejor calidad para texto pequeño)
 
 **Ejemplo:**
 ```json
 {
   "image_url": "https://...",
   "sharpen": true,
-  "sharpen_strength": 1.5
+  "sharpen_strength": 0.8,
+  "sharpen_method": "unsharp",
+  "preserve_fine_details": true
 }
 ```
 
@@ -349,6 +377,24 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 }
 ```
 
+### `small_text_sharp` ⭐⭐ (NUEVO)
+```json
+{
+  "smart_table_analysis": true,
+  "upscale": true,
+  "min_size": 1500,
+  "max_scale": 5.0,
+  "upscale_method": "lanczos4",
+  "deblur": true,
+  "deblur_method": "aggressive",
+  "deblur_strength": 1.5,
+  "sharpen": true,
+  "sharpen_strength": 0.8,
+  "sharpen_method": "unsharp",
+  "preserve_fine_details": true
+}
+```
+
 ### `minimal`
 ```json
 {
@@ -416,6 +462,33 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 }
 ```
 
+### Ejemplo 6: Tabla con Texto MUY Pequeño y Pegado ⭐⭐
+```json
+{
+  "image_url": "https://example.com/tabla-texto-pequeno.jpg",
+  "preset": "small_text_sharp"
+}
+```
+
+**O configuración manual avanzada:**
+```json
+{
+  "image_url": "https://example.com/tabla-texto-pequeno.jpg",
+  "smart_table_analysis": true,
+  "upscale": true,
+  "min_size": 1500,
+  "max_scale": 5.0,
+  "upscale_method": "lanczos4",
+  "deblur": true,
+  "deblur_method": "aggressive",
+  "deblur_strength": 1.5,
+  "sharpen": true,
+  "sharpen_strength": 0.8,
+  "sharpen_method": "unsharp",
+  "preserve_fine_details": true
+}
+```
+
 ---
 
 ## 📤 Respuesta del Endpoint
@@ -462,6 +535,14 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 - Activa `deblur: true` si el texto está borroso
 - Aumenta `min_size` a 1000-1200 para mejor calidad
 
+### Para Texto MUY Pequeño y Pegado ⭐⭐
+- Usa `preset: "small_text_sharp"` (¡RECOMENDADO!)
+- O configura manualmente:
+  - `upscale_method: "lanczos4"` + `min_size: 1500` + `max_scale: 5.0`
+  - `deblur: true` + `deblur_method: "aggressive"` + `deblur_strength: 1.5`
+  - `sharpen: true` + `sharpen_method: "unsharp"` + `sharpen_strength: 0.8`
+  - `preserve_fine_details: true`
+
 ### Para Documentos Estándar
 - Usa `preset: "table_ocr"` (default)
 - No necesitas modificar opciones
@@ -494,25 +575,147 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 
 ---
 
-## 🔗 Endpoints Adicionales
+## 🔗 Endpoints Disponibles
 
-### `/analyze`
+### `/preprocess` (POST)
+Devuelve JSON con la imagen en base64 y metadata completa.
+
+**Request:**
+```json
+{
+  "image_url": "https://...",
+  "force_strategy": "white_on_black",
+  "upscale": true
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "processed_image": "base64...",
+  "original_size": {"w": 800, "h": 600},
+  "processed_size": {"w": 1600, "h": 1200},
+  "preprocessing_metadata": {...}
+}
+```
+
+---
+
+### `/preprocess-image` (POST) ⭐ NUEVO
+Devuelve la imagen procesada **directamente** como archivo (no JSON).
+
+**Request:**
+```json
+{
+  "image_url": "https://...",
+  "force_strategy": "white_on_black",
+  "upscale": true,
+  "format": "png"
+}
+```
+
+**Opciones adicionales:**
+- `format`: `"png"` (default), `"jpg"`, `"jpeg"`, `"webp"`
+
+**Response:**
+- Archivo de imagen directamente
+- Content-Type: `image/png`, `image/jpeg`, o `image/webp`
+
+**Headers de Respuesta:**
+- `X-Original-Width`: Ancho de la imagen original
+- `X-Original-Height`: Alto de la imagen original
+- `X-Processed-Width`: Ancho de la imagen procesada
+- `X-Processed-Height`: Alto de la imagen procesada
+- `X-Applied-Operations`: Operaciones aplicadas (separadas por comas)
+- `X-Smart-Analysis`: `true` si se usó análisis inteligente
+- `X-Strategy`: Estrategia usada (si aplica)
+
+**Ejemplo de uso con curl:**
+```bash
+# Descargar imagen procesada
+curl -X POST http://localhost:5000/preprocess-image \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/image.jpg", "upscale": true}' \
+  --output processed.png
+
+# Ver headers de metadata
+curl -X POST http://localhost:5000/preprocess-image \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/image.jpg"}' \
+  -I
+```
+
+**Ejemplo de uso con JavaScript:**
+```javascript
+const response = await fetch('http://localhost:5000/preprocess-image', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    image_url: 'https://example.com/image.jpg',
+    force_strategy: 'red_background_advanced',
+    upscale: true,
+    format: 'png'
+  })
+});
+
+// Obtener metadata de los headers
+const originalWidth = response.headers.get('X-Original-Width');
+const processedWidth = response.headers.get('X-Processed-Width');
+const operations = response.headers.get('X-Applied-Operations');
+
+// Obtener la imagen como blob
+const blob = await response.blob();
+const imageUrl = URL.createObjectURL(blob);
+
+// Usar la imagen
+document.getElementById('myImage').src = imageUrl;
+```
+
+**Ventajas:**
+- ✅ Más eficiente (no hay codificación base64)
+- ✅ Menos uso de memoria
+- ✅ Descarga directa con curl/wget
+- ✅ Fácil integración con `<img>` en HTML
+- ✅ Metadata disponible en headers HTTP
+
+---
+
+### `/analyze` (POST)
 Analiza una imagen y sugiere operaciones recomendadas.
 
+**Request:**
 ```json
 {
   "image_url": "https://..."
 }
 ```
 
-### `/extract-pdf-fe`
+---
+
+### `/extract-pdf-fe` (POST)
 Extrae texto embebido de PDFs.
 
+**Request:**
 ```json
 {
-  "pdf_url": "https://...",
+  "pdf_url": "https://..."
 }
 ```
+
+---
+
+## 📊 Comparación de Endpoints
+
+| Característica | `/preprocess` | `/preprocess-image` |
+|----------------|---------------|---------------------|
+| Formato de respuesta | JSON con base64 | Archivo de imagen directo |
+| Metadata | ✅ En JSON | ✅ En headers HTTP |
+| Tamaño de respuesta | ~33% más grande | Más pequeño (sin base64) |
+| Uso en navegador | Requiere decodificar base64 | Directo en `<img src>` |
+| Descarga con curl | Requiere parsear JSON | Directo con `--output` |
+| Uso de memoria | Mayor | Menor |
+| **Recomendado para** | APIs, JavaScript avanzado | Visualización, descargas, CLIs |
 
 ---
 

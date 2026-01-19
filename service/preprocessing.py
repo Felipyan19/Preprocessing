@@ -199,30 +199,86 @@ def denoise_image(img: np.ndarray, method: str = 'bilateral') -> np.ndarray:
     return img
 
 
-def upscale_image(img: np.ndarray, scale: float = 2.0) -> np.ndarray:
-    """Agranda imagen pequena."""
-    return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+def upscale_image(img: np.ndarray, scale: float = 2.0, method: str = 'cubic') -> np.ndarray:
+    """
+    Agranda imagen pequeña.
+    
+    Args:
+        img: Imagen a escalar
+        scale: Factor de escalado
+        method: 'cubic' (default), 'lanczos4' (mejor calidad para texto pequeño), 'linear'
+    """
+    if method == 'lanczos4':
+        # Lanczos4 preserva mejor los detalles finos (texto pequeño)
+        return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
+    elif method == 'linear':
+        return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+    else:
+        return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
 
-def sharpen_image(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
-    """Aumenta nitidez."""
-    kernel = np.array([[-1, -1, -1], [-1, 9 + strength, -1], [-1, -1, -1]])
-    return cv2.filter2D(img, -1, kernel)
+def sharpen_image(img: np.ndarray, strength: float = 1.0, method: str = 'kernel') -> np.ndarray:
+    """
+    Aumenta nitidez.
+    
+    Args:
+        img: Imagen a procesar
+        strength: Intensidad del sharpening
+        method: 'kernel' (rápido), 'unsharp' (mejor calidad para texto pequeño)
+    """
+    if method == 'unsharp':
+        # Unsharp mask - mejor para texto pequeño
+        gaussian = cv2.GaussianBlur(img, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(img, 1.0 + strength, gaussian, -strength, 0)
+        return sharpened
+    else:
+        # Kernel tradicional
+        kernel = np.array([[-1, -1, -1], [-1, 9 + strength, -1], [-1, -1, -1]])
+        return cv2.filter2D(img, -1, kernel)
 
 
-def deblur_image(img: np.ndarray, method: str = 'unsharp') -> np.ndarray:
+def deblur_image(img: np.ndarray, method: str = 'unsharp', strength: float = 1.0) -> np.ndarray:
     """
     Reduce borrosidad de la imagen.
     Especialmente efectivo para tablas con texto borroso.
     
     Args:
         img: Imagen a procesar
-        method: 'unsharp' o 'laplacian'
+        method: 'unsharp', 'laplacian', 'aggressive' (para texto muy pequeño)
+        strength: Factor de intensidad (0.5-2.0)
     """
-    if method == 'unsharp':
+    if method == 'aggressive':
+        # Deblurring agresivo para texto muy pequeño y pegado
+        # Paso 1: Unsharp mask fuerte
+        gaussian = cv2.GaussianBlur(img, (0, 0), 3.0)
+        unsharp = cv2.addWeighted(img, 1.5 * strength, gaussian, -0.5 * strength, 0)
+        
+        # Paso 2: High-pass filter para resaltar bordes
+        if len(unsharp.shape) == 3:
+            gray = cv2.cvtColor(unsharp, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = unsharp
+        
+        # Aplicar filtro high-pass
+        kernel_size = 3
+        kernel = np.array([
+            [-1, -1, -1],
+            [-1,  9, -1],
+            [-1, -1, -1]
+        ]) * (0.3 * strength)
+        kernel[1, 1] = 1 + kernel[1, 1]
+        
+        if len(img.shape) == 3:
+            sharpened = cv2.filter2D(unsharp, -1, kernel)
+        else:
+            sharpened = cv2.filter2D(gray, -1, kernel)
+        
+        return sharpened
+        
+    elif method == 'unsharp':
         # Unsharp masking - muy efectivo para borrosidad
         gaussian = cv2.GaussianBlur(img, (0, 0), 2.0)
-        unsharp = cv2.addWeighted(img, 2.0, gaussian, -1.0, 0)
+        unsharp = cv2.addWeighted(img, 1.0 + strength, gaussian, -strength, 0)
         return unsharp
     elif method == 'laplacian':
         # Sharpening con Laplacian
@@ -233,9 +289,9 @@ def deblur_image(img: np.ndarray, method: str = 'unsharp') -> np.ndarray:
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         laplacian = np.uint8(np.absolute(laplacian))
         if len(img.shape) == 3:
-            sharpened = cv2.addWeighted(img, 1.5, cv2.cvtColor(laplacian, cv2.COLOR_GRAY2BGR), -0.5, 0)
+            sharpened = cv2.addWeighted(img, 1.0 + 0.5 * strength, cv2.cvtColor(laplacian, cv2.COLOR_GRAY2BGR), -0.5 * strength, 0)
         else:
-            sharpened = cv2.addWeighted(img, 1.5, laplacian, -0.5, 0)
+            sharpened = cv2.addWeighted(img, 1.0 + 0.5 * strength, laplacian, -0.5 * strength, 0)
         return sharpened
     return img
 
@@ -567,17 +623,19 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         h, w = result.shape[:2]
         min_size = options.get('min_size', 800)
         max_scale = options.get('max_scale', 3.0)
+        upscale_method = options.get('upscale_method', 'cubic')
         if options.get('upscale', True) and (h < min_size or w < min_size):
             scale = min(max(min_size / min(h, w), 1.5), max_scale)
-            result = upscale_image(result, scale)
-            applied.append(f'upscale_{scale:.1f}x')
+            result = upscale_image(result, scale, upscale_method)
+            applied.append(f'upscale_{scale:.1f}x_{upscale_method}')
 
-        # NUEVO: Deblurring si la imagen está borrosa
+        # NUEVO: Deblurring ANTES de conversión (clave para texto pequeño)
         if options.get('deblur', False):
             deblur_method = options.get('deblur_method', 'unsharp')
-            result = deblur_image(result, deblur_method)
-            applied.append(f'deblur_{deblur_method}')
-            logger.info("Aplicado deblurring con método: %s", deblur_method)
+            deblur_strength = options.get('deblur_strength', 1.0)
+            result = deblur_image(result, deblur_method, deblur_strength)
+            applied.append(f'deblur_{deblur_method}_{deblur_strength}')
+            logger.info("Aplicado deblurring con método: %s, strength: %.1f", deblur_method, deblur_strength)
 
         # Detectar regiones de tabla
         regions = detect_table_regions(result)
@@ -613,10 +671,21 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         result = apply_smart_conversion(result, strategy, analysis)
         applied.append(f'smart_conversion_{strategy}')
 
-        # Denoise ligero después de la conversión
-        if len(result.shape) == 2:
-            result = cv2.medianBlur(result, 3)
-            applied.append('median_blur')
+        # Sharpening DESPUÉS de conversión (opcional, para texto pequeño)
+        if options.get('sharpen', False):
+            sharpen_strength = options.get('sharpen_strength', 1.0)
+            sharpen_method = options.get('sharpen_method', 'unsharp')
+            if len(result.shape) == 2:
+                # Imagen ya binarizada, aplicar sharpening suave
+                result = sharpen_image(result, sharpen_strength, sharpen_method)
+                applied.append(f'sharpen_{sharpen_method}_{sharpen_strength}')
+                logger.info("Aplicado sharpening post-conversión: %s, strength: %.1f", sharpen_method, sharpen_strength)
+
+        # Denoise ligero después de la conversión (solo si no es texto muy pequeño)
+        if not options.get('preserve_fine_details', False):
+            if len(result.shape) == 2:
+                result = cv2.medianBlur(result, 3)
+                applied.append('median_blur')
 
         metadata['applied_operations'] = applied
         logger.info("Pipeline inteligente completado: %s", applied)
