@@ -89,9 +89,10 @@ def enhance_contrast_clahe(img: np.ndarray, clip_limit: float = 3.0) -> np.ndarr
     return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 def remove_color_background(img: np.ndarray) -> np.ndarray:
-    """Elimina fondos rojos, azules, verdes."""
+    """Elimina fondos de color preservando texto claro."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
+    # Detectar areas de color saturado (fondos de color)
     # Rojo
     mask_red1 = cv2.inRange(hsv, np.array([0, 50, 50]), np.array([10, 255, 255]))
     mask_red2 = cv2.inRange(hsv, np.array([170, 50, 50]), np.array([180, 255, 255]))
@@ -103,10 +104,64 @@ def remove_color_background(img: np.ndarray) -> np.ndarray:
     # Verde
     mask_green = cv2.inRange(hsv, np.array([35, 50, 50]), np.array([85, 255, 255]))
 
-    combined = cv2.bitwise_or(mask_red, cv2.bitwise_or(mask_blue, mask_green))
+    # Amarillo/Naranja
+    mask_yellow = cv2.inRange(hsv, np.array([15, 50, 50]), np.array([35, 255, 255]))
+
+    combined = cv2.bitwise_or(mask_red, cv2.bitwise_or(mask_blue, cv2.bitwise_or(mask_green, mask_yellow)))
     result = img.copy()
     result[combined > 0] = [255, 255, 255]
     return result
+
+def extract_text_from_colored_bg(img: np.ndarray) -> np.ndarray:
+    """
+    Extrae texto claro (blanco) de fondos de color.
+    Ideal para tablas nutricionales con fondo rojo/azul y texto blanco.
+    """
+    # Convertir a escala de grises
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # El texto blanco tiene valores altos en escala de grises
+    # Invertir para que texto blanco sea negro (mejor para OCR)
+    inverted = cv2.bitwise_not(gray)
+
+    # Aplicar threshold para separar texto del fondo
+    _, binary = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Invertir de nuevo: texto negro sobre fondo blanco
+    result = cv2.bitwise_not(binary)
+
+    return result
+
+def extract_text_adaptive(img: np.ndarray) -> np.ndarray:
+    """
+    Extraccion adaptativa de texto - funciona con texto claro u oscuro.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Usar CLAHE para mejorar contraste local
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    # Threshold adaptativo
+    binary = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 10
+    )
+
+    # Determinar si necesita inversion (texto claro sobre fondo oscuro)
+    # Contar pixeles blancos en los bordes vs centro
+    h, w = binary.shape
+    border_mean = np.mean([
+        np.mean(binary[0:10, :]),      # top
+        np.mean(binary[-10:, :]),      # bottom
+        np.mean(binary[:, 0:10]),      # left
+        np.mean(binary[:, -10:])       # right
+    ])
+
+    # Si los bordes son mayormente oscuros, el fondo es oscuro -> invertir
+    if border_mean < 127:
+        binary = cv2.bitwise_not(binary)
+
+    return binary
 
 def adaptive_binarize(img: np.ndarray, method: str = 'otsu') -> np.ndarray:
     """Binarizacion adaptativa."""
@@ -204,10 +259,17 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> np
     result = img.copy()
     applied = []
 
+    # 0. Rotar si es necesario (para imagenes al reves)
+    if options.get('rotate_180', False):
+        result = cv2.rotate(result, cv2.ROTATE_180)
+        applied.append('rotate_180')
+
     # 1. Upscale si es pequena
     h, w = result.shape[:2]
-    if options.get('upscale', True) and (h < 800 or w < 800):
-        scale = min(max(800 / min(h, w), 1.5), 3.0)
+    min_size = options.get('min_size', 800)
+    max_scale = options.get('max_scale', 3.0)
+    if options.get('upscale', True) and (h < min_size or w < min_size):
+        scale = min(max(min_size / min(h, w), 1.5), max_scale)
         result = upscale_image(result, scale)
         applied.append(f'upscale_{scale:.1f}x')
 
@@ -216,8 +278,16 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> np
         result = enhance_contrast_clahe(result, options.get('clip_limit', 3.0))
         applied.append('clahe')
 
-    # 3. Eliminar fondos de color
-    if options.get('remove_color_bg', True):
+    # 3. Extraer texto de fondo de color (NUEVO - para texto blanco sobre fondo rojo)
+    if options.get('extract_white_text', False):
+        result = extract_text_from_colored_bg(result)
+        applied.append('extract_white_text')
+    # O usar extraccion adaptativa
+    elif options.get('extract_text_adaptive', False):
+        result = extract_text_adaptive(result)
+        applied.append('extract_text_adaptive')
+    # O eliminar fondos de color (metodo anterior)
+    elif options.get('remove_color_bg', True):
         result = remove_color_background(result)
         applied.append('remove_color_bg')
 
@@ -228,21 +298,26 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> np
 
     # 5. Reducir ruido
     if options.get('denoise', True):
-        result = denoise_image(result, options.get('denoise_method', 'bilateral'))
+        denoise_method = options.get('denoise_method', 'bilateral')
+        # Si la imagen es binaria (2D), usar metodo apropiado
+        if len(result.shape) == 2:
+            result = cv2.medianBlur(result, 3)
+        else:
+            result = denoise_image(result, denoise_method)
         applied.append('denoise')
 
     # 6. Nitidez (opcional)
-    if options.get('sharpen', False):
+    if options.get('sharpen', False) and len(result.shape) == 3:
         result = sharpen_image(result, options.get('sharpen_strength', 1.0))
         applied.append('sharpen')
 
-    # 7. Binarizar (opcional)
-    if options.get('binarize', False):
+    # 7. Binarizar (opcional, solo si no se hizo extract_text)
+    if options.get('binarize', False) and len(result.shape) == 3:
         result = adaptive_binarize(result, options.get('binarize_method', 'otsu'))
         applied.append('binarize')
 
     # 8. Invertir si es necesario
-    if options.get('auto_invert', True):
+    if options.get('auto_invert', True) and len(result.shape) == 3:
         result = invert_if_dark(result)
 
     logger.info("Aplicado: %s", applied)
@@ -312,6 +387,23 @@ def preprocess():
                     'binarize_method': 'adaptive_gaussian',
                     'auto_invert': True,
                     'clip_limit': 4.0,
+                }
+            elif preset == 'white_text_on_color':
+                # Para tablas con TEXTO BLANCO sobre fondo de COLOR (rojo, azul, etc)
+                options = {
+                    'rotate_180': False,  # Cambiar a True si imagen esta al reves
+                    'upscale': True,
+                    'min_size': 1200,     # Mayor resolucion para texto pequeño
+                    'max_scale': 4.0,
+                    'enhance_contrast': True,
+                    'clip_limit': 5.0,    # Contraste mas agresivo
+                    'extract_white_text': True,  # CLAVE: extrae texto blanco
+                    'remove_color_bg': False,
+                    'deskew': True,
+                    'denoise': True,
+                    'sharpen': False,
+                    'binarize': False,    # Ya viene binario de extract_white_text
+                    'auto_invert': False,
                 }
             elif preset == 'minimal':
                 options = {
