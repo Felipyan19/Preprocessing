@@ -6,6 +6,7 @@ services:
     environment:
       - PORT=5050
       - DEBUG=false
+      - PYTHONUNBUFFERED=1
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
