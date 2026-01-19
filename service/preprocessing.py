@@ -176,17 +176,344 @@ def invert_if_dark(img: np.ndarray) -> np.ndarray:
 
 
 # ============================================
+# ANÁLISIS DINÁMICO DE COLOR PARA TABLAS
+# ============================================
+
+def detect_table_regions(img: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """
+    Detecta regiones rectangulares que contengan tablas.
+    Retorna lista de bounding boxes: [(x, y, w, h), ...]
+    Si no detecta nada, retorna la imagen completa.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    h, w = gray.shape
+
+    # Detectar bordes
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # Detectar líneas horizontales y verticales (características de tablas)
+    kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 30, 1))
+    kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, h // 30))
+
+    horizontal_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_horizontal)
+    vertical_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_vertical)
+
+    # Combinar líneas
+    table_structure = cv2.add(horizontal_lines, vertical_lines)
+
+    # Dilatar para conectar regiones
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(table_structure, kernel, iterations=2)
+
+    # Encontrar contornos
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    regions = []
+    min_area = (w * h) * 0.05  # Al menos 5% del área total
+
+    for contour in contours:
+        x, y, cw, ch = cv2.boundingRect(contour)
+        area = cw * ch
+
+        # Filtrar regiones muy pequeñas o que ocupan casi toda la imagen
+        if area > min_area and area < (w * h) * 0.95:
+            # Expandir ligeramente la región para capturar todo el contenido
+            margin = 10
+            x = max(0, x - margin)
+            y = max(0, y - margin)
+            cw = min(w - x, cw + 2 * margin)
+            ch = min(h - y, ch + 2 * margin)
+            regions.append((x, y, cw, ch))
+
+    # Si no se detectaron regiones, usar toda la imagen
+    if not regions:
+        logger.info("No se detectaron regiones de tabla, usando imagen completa")
+        return [(0, 0, w, h)]
+
+    logger.info("Detectadas %d regiones de tabla", len(regions))
+    return regions
+
+
+def analyze_text_and_background_colors(img: np.ndarray, region: tuple[int, int, int, int] | None = None) -> dict:
+    """
+    Analiza colores dominantes del texto y fondo en una región.
+
+    Args:
+        img: Imagen BGR
+        region: (x, y, w, h) o None para toda la imagen
+
+    Returns:
+        dict con:
+            - text_color: (R, G, B)
+            - text_luminosity: 0.0-1.0
+            - bg_color: (R, G, B)
+            - bg_luminosity: 0.0-1.0
+            - contrast: 0.0-1.0
+    """
+    # Extraer región de interés
+    if region:
+        x, y, w, h = region
+        roi = img[y:y+h, x:x+w].copy()
+    else:
+        roi = img.copy()
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    # Detectar bordes para identificar texto
+    edges = cv2.Canny(gray, 50, 150)
+
+    # Dilatar bordes para capturar área de texto
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    text_mask = cv2.dilate(edges, kernel, iterations=2)
+
+    # Invertir para obtener máscara de fondo
+    bg_mask = cv2.bitwise_not(text_mask)
+
+    # Calcular color promedio del texto
+    text_pixels = roi[text_mask > 0]
+    if len(text_pixels) > 0:
+        text_color = np.mean(text_pixels, axis=0).astype(int)
+        text_gray = np.mean(gray[text_mask > 0])
+    else:
+        # Fallback: usar píxeles más oscuros o más claros
+        threshold = np.median(gray)
+        if np.mean(gray) > 127:
+            # Imagen clara, texto probablemente oscuro
+            text_color = np.mean(roi[gray < threshold], axis=0).astype(int) if np.any(gray < threshold) else np.array([0, 0, 0])
+            text_gray = np.mean(gray[gray < threshold]) if np.any(gray < threshold) else 0
+        else:
+            # Imagen oscura, texto probablemente claro
+            text_color = np.mean(roi[gray > threshold], axis=0).astype(int) if np.any(gray > threshold) else np.array([255, 255, 255])
+            text_gray = np.mean(gray[gray > threshold]) if np.any(gray > threshold) else 255
+
+    # Calcular color promedio del fondo
+    bg_pixels = roi[bg_mask > 0]
+    if len(bg_pixels) > 50:  # Necesitamos suficientes píxeles
+        bg_color = np.mean(bg_pixels, axis=0).astype(int)
+        bg_gray = np.mean(gray[bg_mask > 0])
+    else:
+        # Fallback: usar color promedio global
+        bg_color = np.mean(roi.reshape(-1, 3), axis=0).astype(int)
+        bg_gray = np.mean(gray)
+
+    # Calcular luminosidad (0.0 = negro, 1.0 = blanco)
+    text_luminosity = float(text_gray) / 255.0
+    bg_luminosity = float(bg_gray) / 255.0
+
+    # Calcular contraste
+    contrast = abs(text_luminosity - bg_luminosity)
+
+    analysis = {
+        'text_color': tuple(int(c) for c in text_color[::-1]),  # BGR -> RGB
+        'text_luminosity': text_luminosity,
+        'bg_color': tuple(int(c) for c in bg_color[::-1]),  # BGR -> RGB
+        'bg_luminosity': bg_luminosity,
+        'contrast': contrast,
+    }
+
+    logger.info(
+        "Análisis de color - Texto: RGB%s (L=%.2f), Fondo: RGB%s (L=%.2f), Contraste: %.2f",
+        analysis['text_color'],
+        text_luminosity,
+        analysis['bg_color'],
+        bg_luminosity,
+        contrast,
+    )
+
+    return analysis
+
+
+def decide_conversion_strategy(analysis: dict) -> str:
+    """
+    Decide la estrategia de conversión basada en el análisis de colores.
+
+    Estrategias:
+        - 'white_on_black': Texto claro sobre fondo oscuro
+        - 'black_on_white': Texto oscuro sobre fondo claro
+        - 'enhance_contrast': Bajo contraste, aumentar primero
+        - 'extract_luminosity': Fondo de color saturado
+        - 'invert_colors': Invertir todo
+    """
+    text_lum = analysis['text_luminosity']
+    bg_lum = analysis['bg_luminosity']
+    contrast = analysis['contrast']
+
+    # Bajo contraste: necesita mejora
+    if contrast < 0.3:
+        logger.info("Estrategia: enhance_contrast (contraste bajo: %.2f)", contrast)
+        return 'enhance_contrast'
+
+    # Detectar si el fondo es de color saturado
+    bg_r, bg_g, bg_b = analysis['bg_color']
+    bg_saturation = (max(bg_r, bg_g, bg_b) - min(bg_r, bg_g, bg_b)) / 255.0
+
+    if bg_saturation > 0.4 and contrast > 0.3:
+        logger.info("Estrategia: extract_luminosity (fondo saturado: %.2f)", bg_saturation)
+        return 'extract_luminosity'
+
+    # Texto claro sobre fondo oscuro
+    if text_lum > 0.6 and bg_lum < 0.5:
+        logger.info("Estrategia: white_on_black (texto claro sobre fondo oscuro)")
+        return 'white_on_black'
+
+    # Texto oscuro sobre fondo claro
+    if text_lum < 0.5 and bg_lum > 0.6:
+        logger.info("Estrategia: black_on_white (texto oscuro sobre fondo claro)")
+        return 'black_on_white'
+
+    # Invertido: texto oscuro sobre fondo claro pero al revés
+    if text_lum < 0.5 and bg_lum < 0.5:
+        logger.info("Estrategia: invert_colors (ambos oscuros, necesita inversión)")
+        return 'invert_colors'
+
+    # Por defecto: texto oscuro sobre fondo claro (estándar OCR)
+    logger.info("Estrategia: black_on_white (por defecto)")
+    return 'black_on_white'
+
+
+def apply_smart_conversion(img: np.ndarray, strategy: str, analysis: dict) -> np.ndarray:
+    """
+    Aplica la estrategia de conversión decidida.
+    """
+    result = img.copy()
+
+    if strategy == 'enhance_contrast':
+        # Aumentar contraste agresivamente
+        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
+        clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        # Binarización adaptativa
+        result = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8
+        )
+        logger.info("Aplicado: enhance_contrast con CLAHE + adaptive threshold")
+
+    elif strategy == 'extract_luminosity':
+        # Extraer canal de luminosidad (ignora color)
+        if len(result.shape) == 3:
+            lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+            l_channel, _, _ = cv2.split(lab)
+            # Aplicar CLAHE al canal L
+            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+            enhanced_l = clahe.apply(l_channel)
+            # Binarización
+            _, result = cv2.threshold(enhanced_l, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Decidir si invertir basado en luminosidad del texto
+            if analysis['text_luminosity'] > 0.6:
+                result = cv2.bitwise_not(result)
+            logger.info("Aplicado: extract_luminosity (canal L de LAB)")
+        else:
+            result = adaptive_binarize(result)
+
+    elif strategy == 'white_on_black':
+        # Convertir a escala de grises
+        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
+        # Invertir para que texto oscuro sobre fondo claro
+        inverted = cv2.bitwise_not(gray)
+        # Binarización Otsu
+        _, binary = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Volver a invertir para texto claro sobre fondo oscuro -> texto oscuro sobre fondo claro
+        result = cv2.bitwise_not(binary)
+        logger.info("Aplicado: white_on_black (invertir + Otsu + invertir)")
+
+    elif strategy == 'black_on_white':
+        # Texto oscuro sobre fondo claro - solo binarizar
+        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
+        _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        logger.info("Aplicado: black_on_white (Otsu directo)")
+
+    elif strategy == 'invert_colors':
+        # Invertir todo
+        result = cv2.bitwise_not(result)
+        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
+        _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        logger.info("Aplicado: invert_colors")
+
+    return result
+
+
+# ============================================
 # PIPELINE PRINCIPAL
 # ============================================
 
-def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> np.ndarray:
-    """Pipeline optimizado para tablas nutricionales."""
+def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tuple[np.ndarray, dict]:
+    """
+    Pipeline optimizado para tablas nutricionales.
+
+    Returns:
+        tuple: (imagen_procesada, metadata) donde metadata contiene:
+            - applied_operations: lista de operaciones aplicadas
+            - smart_analysis_used: bool
+            - strategy: estrategia usada (si smart_analysis_used=True)
+            - color_analysis: análisis de colores (si smart_analysis_used=True)
+    """
     if options is None:
         options = {}
 
     result = img.copy()
     applied = []
+    metadata = {
+        'applied_operations': [],
+        'smart_analysis_used': False,
+    }
 
+    # NUEVO: Análisis inteligente de color para tablas
+    if options.get('smart_table_analysis', True):
+        logger.info("=== ANÁLISIS INTELIGENTE DE TABLAS ACTIVADO ===")
+        metadata['smart_analysis_used'] = True
+
+        # Rotación inicial si es necesario
+        if options.get('rotate_180', False):
+            result = cv2.rotate(result, cv2.ROTATE_180)
+            applied.append('rotate_180')
+
+        # Upscale inicial si es necesario
+        h, w = result.shape[:2]
+        min_size = options.get('min_size', 800)
+        max_scale = options.get('max_scale', 3.0)
+        if options.get('upscale', True) and (h < min_size or w < min_size):
+            scale = min(max(min_size / min(h, w), 1.5), max_scale)
+            result = upscale_image(result, scale)
+            applied.append(f'upscale_{scale:.1f}x')
+
+        # Detectar regiones de tabla
+        regions = detect_table_regions(result)
+        metadata['detected_regions'] = len(regions)
+
+        # Analizar la región más grande (asumiendo que es la tabla principal)
+        largest_region = max(regions, key=lambda r: r[2] * r[3])
+
+        # Analizar colores de texto y fondo
+        analysis = analyze_text_and_background_colors(result, largest_region)
+
+        # Decidir estrategia de conversión
+        strategy = decide_conversion_strategy(analysis)
+
+        # Guardar en metadata
+        metadata['strategy'] = strategy
+        metadata['color_analysis'] = {
+            'text_color': analysis['text_color'],
+            'text_luminosity': round(analysis['text_luminosity'], 2),
+            'bg_color': analysis['bg_color'],
+            'bg_luminosity': round(analysis['bg_luminosity'], 2),
+            'contrast': round(analysis['contrast'], 2),
+        }
+
+        # Aplicar conversión inteligente
+        result = apply_smart_conversion(result, strategy, analysis)
+        applied.append(f'smart_conversion_{strategy}')
+
+        # Denoise ligero después de la conversión
+        if len(result.shape) == 2:
+            result = cv2.medianBlur(result, 3)
+            applied.append('median_blur')
+
+        metadata['applied_operations'] = applied
+        logger.info("Pipeline inteligente completado: %s", applied)
+        return result, metadata
+
+    # FALLBACK: Pipeline clásico (si smart_table_analysis está desactivado)
     if options.get('rotate_180', False):
         result = cv2.rotate(result, cv2.ROTATE_180)
         applied.append('rotate_180')
@@ -236,5 +563,6 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> np
     if options.get('auto_invert', True) and len(result.shape) == 3:
         result = invert_if_dark(result)
 
+    metadata['applied_operations'] = applied
     logger.info("Aplicado: %s", applied)
-    return result
+    return result, metadata

@@ -104,7 +104,7 @@ def preprocess():
                     'auto_invert': True,
                 }
 
-        processed = preprocess_for_table_ocr(img, options)
+        processed, metadata = preprocess_for_table_ocr(img, options)
         result_b64 = encode_image_to_base64(processed)
 
         return jsonify(
@@ -113,6 +113,7 @@ def preprocess():
                 'processed_image': result_b64,
                 'original_size': {'w': img.shape[1], 'h': img.shape[0]},
                 'processed_size': {'w': processed.shape[1], 'h': processed.shape[0]},
+                'preprocessing_metadata': metadata,
             }
         )
 
