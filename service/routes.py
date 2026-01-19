@@ -30,11 +30,38 @@ def preprocess():
     Body: {
         "image_url": "https://...",     # o
         "image_base64": "base64...",
-        "preset": "table_ocr",          # table_ocr, table_ocr_aggressive, minimal
-        "options": {                    # opcional
-            "force_strategy": "white_on_black"  # Estrategias: white_on_black, black_on_white,
-                                                 # enhance_contrast, extract_luminosity, invert_colors
-        }
+        "preset": "table_ocr",          # Presets disponibles:
+                                        #   - table_ocr (default)
+                                        #   - table_ocr_aggressive
+                                        #   - white_text_on_color
+                                        #   - red_table_blurry (NUEVO: para fondo rojo + texto blanco borroso)
+                                        #   - smart_auto (NUEVO: análisis inteligente automático)
+                                        #   - minimal
+        
+        # Opciones directas (sin anidación):
+        "smart_table_analysis": true,
+        "force_strategy": "red_background_advanced",  # Estrategias: white_on_black, black_on_white,
+                                                      # enhance_contrast, extract_luminosity, 
+                                                      # red_background_advanced (NUEVO), invert_colors
+        "deblur": true,
+        "deblur_method": "unsharp",
+        "upscale": true,
+        "min_size": 1000,
+        "max_scale": 3.0,
+        "rotate_180": false,
+        "enhance_contrast": true,
+        "clip_limit": 3.0,
+        "remove_color_bg": true,
+        "extract_white_text": false,
+        "extract_text_adaptive": false,
+        "deskew": true,
+        "denoise": true,
+        "denoise_method": "bilateral",
+        "sharpen": false,
+        "sharpen_strength": 1.0,
+        "binarize": false,
+        "binarize_method": "otsu",
+        "auto_invert": true
     }
     """
     try:
@@ -51,7 +78,12 @@ def preprocess():
             return jsonify({'error': 'No se pudo decodificar imagen'}), 400
 
         preset = data.get('preset', 'table_ocr')
-        options = data.get('options', {})
+        
+        # Claves especiales que no son opciones de procesamiento
+        special_keys = {'image_url', 'image_base64', 'pdf_url', 'pdf_base64', 'preset'}
+        
+        # Extraer todas las opciones directamente del nivel raíz (excluyendo claves especiales)
+        options = {k: v for k, v in data.items() if k not in special_keys}
 
         if not options:
             if preset == 'table_ocr':
@@ -96,6 +128,27 @@ def preprocess():
                     'sharpen': False,
                     'binarize': False,
                     'auto_invert': False,
+                }
+            elif preset == 'red_table_blurry':
+                # NUEVO: Preset óptimo para tablas con fondo rojo y texto blanco borroso
+                options = {
+                    'smart_table_analysis': True,
+                    'force_strategy': 'red_background_advanced',
+                    'upscale': True,
+                    'min_size': 1000,
+                    'max_scale': 3.0,
+                    'deblur': True,
+                    'deblur_method': 'unsharp',
+                }
+            elif preset == 'smart_auto':
+                # Análisis inteligente automático (sin forzar estrategia)
+                options = {
+                    'smart_table_analysis': True,
+                    'upscale': True,
+                    'min_size': 1000,
+                    'max_scale': 3.0,
+                    'deblur': True,
+                    'deblur_method': 'unsharp',
                 }
             elif preset == 'minimal':
                 options = {
