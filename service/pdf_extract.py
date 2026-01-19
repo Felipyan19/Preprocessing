@@ -307,53 +307,87 @@ def _lines_from_text(value_text: str) -> list:
     return lines
 
 
+def _looks_like_label(text: str) -> bool:
+    """Detecta si el texto parece ser el nombre de una etiqueta (no un valor)."""
+    text_stripped = text.strip()
+    if len(text_stripped) < 3:
+        return False
+    
+    # Nombres comunes de etiquetas
+    label_patterns = [
+        r'^denominaci[oó]n\s+(comercial|legal)',
+        r'^cantidad\s+neta',
+        r'^fecha\s+de\s+consumo',
+        r'^conservaci[oó]n',
+        r'^raz[oó]n\s+social',
+        r'^ingredientes',
+        r'^informaci[oó]n\s+nutricional',
+        r'^textos\s+comerciales',
+        r'^marca\s+de\s+identificaci[oó]n',
+    ]
+    
+    text_lower = text.lower()
+    return any(re.match(pattern, text_lower) for pattern in label_patterns)
+
+
 def _looks_like_different_section(text: str, current_label_key: str) -> bool:
     """Detecta si el texto parece pertenecer a una sección diferente."""
     text_lower = text.lower()
     text_normalized = _normalize_label_key(text)
+    text_stripped = text.strip()
     
-    # Indicadores globales de metadatos que no son contenido de etiqueta
-    metadata_markers = [
-        'ficha etiquetado', 'ref:', 'fecha:', 'version:',
-        'page:', 'página:', 'pagina:',
-        'lote', 'pa:', 'fo:', 'lang:',
-        'instrucciones', 'diseño', 'diseno',
-    ]
+    # Si la línea está vacía, no es una sección diferente
+    if not text_stripped:
+        return False
     
-    # Si el texto contiene marcadores de metadatos
-    for marker in metadata_markers:
-        if marker in text_lower:
+    # 1. Detectar si es metadata del documento
+    if _is_metadata_line(text):
+        return True
+    
+    # 2. Detectar si el texto es exactamente una etiqueta conocida
+    if _looks_like_label(text):
+        return True
+    
+    # 3. Reglas específicas por tipo de etiqueta actual
+    if current_label_key in ('ingredientes', 'ingredients'):
+        # Ingredientes termina cuando empieza otra etiqueta
+        markers = ['cantidad neta', 'fecha de consumo', 'conservacion', 'conservação']
+        if any(text_normalized.startswith(_normalize_label_key(m)) for m in markers):
             return True
     
-    # Marcadores de inicio de nuevas secciones principales
-    new_section_markers = {
-        'razon social', 'razón social',
-        'informacion nutricional', 'información nutricional',
-        'informacao nutricional',
-        'ean', 'codigo de barras',
-    }
-    
-    # Si el texto empieza con un marcador de nueva sección
-    text_start = text_normalized[:50]  # Primeros 50 caracteres
-    for marker in new_section_markers:
-        marker_normalized = _normalize_label_key(marker)
-        if text_start.startswith(marker_normalized):
+    elif current_label_key in ('cantidad neta', 'net quantity'):
+        # Cantidad neta es usualmente corta, termina cuando empieza otra etiqueta
+        markers = ['fecha de consumo', 'conservacion', 'ingredientes']
+        if any(text_normalized.startswith(_normalize_label_key(m)) for m in markers):
             return True
     
-    # Reglas específicas por tipo de etiqueta
-    if current_label_key in ('ingredientes', 'ingredients', 'ingredientes'):
-        # Ingredientes no debe incluir cantidad neta ni fecha de consumo
-        if text_normalized.startswith('cantidad neta') or text_normalized.startswith('fecha de consumo'):
+    elif current_label_key in ('fecha de consumo', 'consumo preferente', 'best before'):
+        # Fecha de consumo termina cuando empieza conservación
+        markers = ['importante:', 'conservar', 'conserver', 'keep']
+        # Pero solo si la línea EMPIEZA con estos marcadores
+        if any(text_normalized.startswith(_normalize_label_key(m)) for m in markers):
             return True
     
-    if current_label_key in ('conservacion', 'conservacao', 'conservation'):
-        # Conservación no debe incluir razón social ni información nutricional
-        if any(text_normalized.startswith(_normalize_label_key(m)) for m in ['razón social', 'razon social', 'lp foodies', 's.a.u', 'ctra.', 'informacion nutricional']):
+    elif current_label_key in ('conservacion', 'conservacao', 'conservation'):
+        # Conservación termina cuando empieza razón social o info nutricional
+        markers = ['razon social', 'razón social', 'lp foodies', 'informacion nutricional', 'informação nutricional', 'ctra.', 'es 10.', 'es  10.']
+        if any(text_normalized.startswith(_normalize_label_key(m)) for m in markers):
+            return True
+        # O si detectamos una empresa específica (razón social)
+        if re.match(r'^[A-Z\s\.]+S\.A\.U\.|^[A-Z\s\.]+S\.L\.|^[A-Z\s\.]+S\.A\.', text_stripped):
             return True
     
-    if current_label_key in ('fecha de consumo', 'consumo preferente', 'best before'):
-        # Fecha de consumo no debe incluir conservación
-        if any(_normalize_label_key(m) in text_normalized for m in ['importante:', 'conservar a', 'conservar em']):
+    elif current_label_key in ('razon social', 'razón social'):
+        # Razón social termina cuando empieza marca de identificación o info nutricional
+        markers = ['es 10.', 'es  10.', 'ce', 'informacion nutricional', 'informação nutricional']
+        # Razón social es corta, detener en marca CE o info nutricional
+        if 'informacion nutricional' in text_normalized or 'informação nutricional' in text_normalized:
+            return True
+    
+    elif 'gda' in current_label_key:
+        # GDA termina cuando empiezan textos comerciales
+        markers = ['textos comerciales', 'punto verde', 'logo']
+        if any(text_normalized.startswith(_normalize_label_key(m)) for m in markers):
             return True
     
     return False
@@ -367,20 +401,23 @@ def _derive_list_items(label_key: str, blocks: list, lines: list) -> list:
     }
     force_list_labels = {
         'denominacion legal',
+        'denominação legal',
         'denomination legal',
-        'denominacao legal',
+        'denomination legale',
         'denomination commerciale',
+        'denominação comercial',
         'ingredientes',
         'ingredients',
+        'ingrédients',
         'ingredients a destacar',
         'ingredientes a destacar',
-        'ingrédients',
         'fecha de consumo',
         'fecha de consumo preferente',
         'best before',
         'consumo preferente',
         'conservacion',
         'conservacao',
+        'conservação',
         'conservation',
         'textos comerciales',
         'telefono/contacto',
@@ -514,33 +551,49 @@ def _is_nutritional_data_line(text: str) -> bool:
 
 
 def _build_table_value(label_text: str, lines: list) -> dict:
+    """Construye el valor de tabla nutricional con raw y notas."""
+    if not lines:
+        return {
+            'titulo': label_text,
+            'headers': _table_headers_from_lines([]),
+            'raw': None,
+            'valorComplementario': None,
+        }
+    
+    # Separar líneas en: encabezados, datos, notas
+    header_lines = []
+    data_lines = []
     notes = []
-    table_content_lines = []
-    header_detected = False
+    
+    capturing_data = False
     
     for line in lines:
         text = line['text']
-        # Separar notas de la tabla
+        text_lower = text.lower()
+        
+        # 1. Detectar notas (siempre van al final)
         if _is_table_note_line(text):
             notes.append(text)
-        # Detectar la línea de encabezados
-        elif not header_detected and any(marker in text.lower() for marker in ['por 100', 'per 100', '%vrn', '%ir', '%dr']):
-            header_detected = True
-            # No agregar la línea de encabezados al contenido raw
             continue
-        # Detectar si la línea contiene datos nutricionales
-        elif _is_nutritional_data_line(text):
-            table_content_lines.append(text)
-        # Si ya empezamos a capturar datos y encontramos una línea que no es dato nutricional, detener
-        elif header_detected and table_content_lines:
-            # Verificar si es realmente una línea que no pertenece a la tabla
-            if not any(marker in text.lower() for marker in ['energía', 'energia', 'grasa', 'lipido', 'hidrato', 'proteína', 'proteina', 'sal', 'hierro', 'ferro']):
+        
+        # 2. Detectar línea de encabezado
+        if not capturing_data and any(marker in text_lower for marker in ['por 100', 'per 100', '%vrn', '%ir', '%dr', 'por racion', 'por dose']):
+            header_lines.append(text)
+            capturing_data = True
+            continue
+        
+        # 3. Capturar datos de la tabla
+        if capturing_data:
+            # Detener si encontramos metadata o nueva sección
+            if _is_metadata_line(text):
                 break
+            # Agregar línea de datos
+            data_lines.append(text)
     
-    # Construir el texto raw con formato estructurado
+    # Construir raw: combinar todas las líneas de datos nutricionales
     raw_text = None
-    if table_content_lines:
-        raw_text = '\n'.join(table_content_lines)
+    if data_lines:
+        raw_text = '\n'.join(data_lines)
     
     value = {
         'titulo': label_text,
@@ -712,6 +765,15 @@ def extract_pdf_fe(pdf_bytes: bytes) -> dict:
         _normalize_label_key('Marca de Identificación'),
         _normalize_label_key('GDA'),
     }
+    # Etiquetas que típicamente tienen valores inline (a la derecha)
+    prefer_inline_labels = {
+        _normalize_label_key('Denominación Comercial'),
+        _normalize_label_key('Denominação Comercial'),
+        _normalize_label_key('Cantidad neta'),
+        _normalize_label_key('Net quantity'),
+        _normalize_label_key('Quantidade líquida'),
+        _normalize_label_key('Ingredientes a destacar'),
+    }
     table_labels = {
         _normalize_label_key('Información nutricional media'),
         _normalize_label_key('Informação nutricional média'),
@@ -776,7 +838,8 @@ def extract_pdf_fe(pdf_bytes: bytes) -> dict:
             else:
                 y_end = page.rect.height
             region = fitz.Rect(0, y_start, page.rect.width, max(y_start, y_end))
-            # Primero intentar detectar valores inline (a la derecha de la etiqueta)
+            
+            # Estrategia 1: Buscar valores inline (a la derecha de la etiqueta, misma línea)
             inline_region = fitz.Rect(
                 label['rect'].x1 + 4,
                 label_text_bbox[1] - 2,
@@ -785,29 +848,57 @@ def extract_pdf_fe(pdf_bytes: bytes) -> dict:
             )
             inline_lines = _lines_in_region(lines_all, inline_region, label_rects, stop_at_metadata=False)
             
-            # Si hay líneas inline, usarlas como candidatas
+            # Verificar si hay contenido inline válido
+            has_inline_content = False
+            inline_text = ''
             if inline_lines:
-                # Verificar si hay contenido significativo inline
                 inline_text = ' '.join(line['text'] for line in inline_lines).strip()
-                if len(inline_text) > 3:  # Si hay contenido significativo inline
+                # Contenido inline es válido si tiene más de 3 caracteres Y no parece ser otra etiqueta
+                if len(inline_text) > 3 and not _looks_like_label(inline_text):
+                    has_inline_content = True
                     logger.info(
-                        "Etiqueta %s (pagina %d): usando inline_lines=%d",
+                        "Etiqueta %s (pagina %d): contenido inline detectado: '%s'",
                         label_text,
                         page_index,
-                        len(inline_lines),
+                        inline_text[:50]
                     )
-                    region_lines = inline_lines
-                    blocks = _group_lines_by_block(region_lines)
-                else:
-                    # Si el contenido inline es muy corto, buscar en la región debajo
-                    region_lines = _lines_in_region(lines_all, region, label_rects)
-                    blocks = _group_lines_by_block(region_lines)
+            
+            # Estrategia 2: Decidir si usar contenido inline o buscar debajo
+            # Algunas etiquetas típicamente tienen valores inline (Denominación Comercial, Cantidad neta, etc.)
+            if has_inline_content and label_key in prefer_inline_labels:
+                # Usar SOLO el contenido inline para etiquetas que prefieren inline
+                region_lines = inline_lines
+                blocks = _group_lines_by_block(region_lines)
+                logger.info(
+                    "Etiqueta %s (pagina %d): usando SOLO contenido inline (prefer_inline_labels)",
+                    label_text,
+                    page_index,
+                )
+            elif has_inline_content:
+                # Para otras etiquetas, usar inline + contenido debajo
+                region_lines = inline_lines
+                blocks = _group_lines_by_block(region_lines)
             else:
-                # Si no hay líneas inline, buscar en la región debajo
-                region_lines = _lines_in_region(lines_all, region, label_rects)
+                # Extraer todas las líneas de la región
+                all_region_lines = _lines_in_region(lines_all, region, label_rects, stop_at_metadata=False)
+                
+                # Filtrar líneas que claramente pertenecen a otra sección
+                region_lines = []
+                for line in all_region_lines:
+                    # Detener si encontramos metadata o inicio de otra sección
+                    if _is_metadata_line(line['text']) or _looks_like_different_section(line['text'], label_key):
+                        logger.info(
+                            "Etiqueta %s (pagina %d): deteniendo en línea: '%s'",
+                            label_text,
+                            page_index,
+                            line['text'][:50]
+                        )
+                        break
+                    region_lines.append(line)
+                
                 blocks = _group_lines_by_block(region_lines)
             
-            # Si aún no hay contenido, usar texto segmentado como fallback
+            # Estrategia 3: Fallback - usar texto segmentado
             if not region_lines:
                 segment_text = text_segments.get(label_text, '').strip()
                 if segment_text:
