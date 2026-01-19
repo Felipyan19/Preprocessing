@@ -31,7 +31,10 @@ def preprocess():
         "image_url": "https://...",     # o
         "image_base64": "base64...",
         "preset": "table_ocr",          # table_ocr, table_ocr_aggressive, minimal
-        "options": {...}                # opcional
+        "options": {                    # opcional
+            "force_strategy": "white_on_black"  # Estrategias: white_on_black, black_on_white,
+                                                 # enhance_contrast, extract_luminosity, invert_colors
+        }
     }
     """
     try:

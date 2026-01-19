@@ -487,8 +487,15 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         # Analizar colores de texto y fondo
         analysis = analyze_text_and_background_colors(result, largest_region)
 
-        # Decidir estrategia de conversión
-        strategy = decide_conversion_strategy(analysis)
+        # Decidir estrategia de conversión (o usar la forzada)
+        force_strategy = options.get('force_strategy')
+        if force_strategy:
+            strategy = force_strategy
+            metadata['strategy_forced'] = True
+            logger.info("Estrategia FORZADA por usuario: %s", strategy)
+        else:
+            strategy = decide_conversion_strategy(analysis)
+            metadata['strategy_forced'] = False
 
         # Guardar en metadata
         metadata['strategy'] = strategy
