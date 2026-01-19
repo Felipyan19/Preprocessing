@@ -874,28 +874,58 @@ def extract_pdf_fe(pdf_bytes: bytes) -> dict:
             region = fitz.Rect(0, y_start, page.rect.width, max(y_start, y_end))
             
             # Estrategia 1: Buscar valores inline (a la derecha de la etiqueta, misma línea)
+            # Expandir región inline para capturar mejor el texto
             inline_region = fitz.Rect(
-                label['rect'].x1 + 4,
-                label_text_bbox[1] - 2,
+                label['rect'].x1 + 2,  # Más cerca de la etiqueta
+                label_text_bbox[1] - 3,  # Un poco más arriba
                 page.rect.width,
-                label_text_bbox[3] + 2,
+                label_text_bbox[3] + 3,  # Un poco más abajo
             )
-            inline_lines = _lines_in_region(lines_all, inline_region, label_rects, stop_at_metadata=False)
+            # NO excluir label_rects para valores inline (permitir captura cerca de la etiqueta)
+            inline_lines_raw = []
+            for line in lines_all:
+                line_rect = fitz.Rect(line['bbox'])
+                if inline_region.intersects(line_rect):
+                    # No excluir si está cerca de la etiqueta actual (solo excluir otras etiquetas)
+                    is_other_label = False
+                    for other_label_rect in label_rects:
+                        if other_label_rect != label['rect'] and line_rect.intersects(other_label_rect):
+                            is_other_label = True
+                            break
+                    if not is_other_label and not _should_skip_line(line['text']):
+                        inline_lines_raw.append(line)
+            
+            inline_lines = inline_lines_raw
             
             # Verificar si hay contenido inline válido
             has_inline_content = False
             inline_text = ''
             if inline_lines:
                 inline_text = ' '.join(line['text'] for line in inline_lines).strip()
-                # Contenido inline es válido si tiene más de 3 caracteres Y no parece ser otra etiqueta
-                if len(inline_text) > 3 and not _looks_like_label(inline_text):
+                # Contenido inline es válido si:
+                # - Tiene al menos 1 carácter (no vacío)
+                # - NO parece ser otra etiqueta
+                if inline_text and not _looks_like_label(inline_text):
                     has_inline_content = True
                     logger.info(
                         "Etiqueta %s (pagina %d): contenido inline detectado: '%s'",
                         label_text,
                         page_index,
-                        inline_text[:50]
+                        inline_text[:50] if len(inline_text) > 50 else inline_text
                     )
+                else:
+                    logger.info(
+                        "Etiqueta %s (pagina %d): texto inline descartado (parece etiqueta o vacío): '%s'",
+                        label_text,
+                        page_index,
+                        inline_text[:50] if inline_text else "<vacío>"
+                    )
+            else:
+                logger.info(
+                    "Etiqueta %s (pagina %d): NO se encontró texto inline en región",
+                    label_text,
+                    page_index,
+                )
             
             # Estrategia 2: Decidir si usar contenido inline o buscar debajo
             # Algunas etiquetas típicamente tienen valores inline (Denominación Comercial, Cantidad neta, etc.)
