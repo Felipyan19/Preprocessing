@@ -399,75 +399,99 @@ def _derive_list_items(label_key: str, blocks: list, lines: list) -> list:
         'telefono/contacto',
         'teléfono/contacto',
     }
+    # Etiquetas que SIEMPRE deben ser lista (según prompt OCR)
+    # Solo si tienen 2+ ítems separados visualmente
     force_list_labels = {
-        'denominacion legal',
+        'denominacion legal',  # ES y PT en líneas separadas
         'denominação legal',
         'denomination legal',
         'denomination legale',
-        'denomination commerciale',
-        'denominação comercial',
-        'ingredientes',
+        'ingredientes',  # ES y PT como bloques separados
         'ingredients',
         'ingrédients',
-        'ingredients a destacar',
-        'ingredientes a destacar',
-        'fecha de consumo',
+        'fecha de consumo',  # ES y PT
         'fecha de consumo preferente',
         'best before',
         'consumo preferente',
-        'conservacion',
+        'conservacion',  # ES y PT
         'conservacao',
         'conservação',
         'conservation',
-        'textos comerciales',
+        'textos comerciales',  # muchas líneas
         'telefono/contacto',
         'teléfono/contacto',
+        'telefono / contacto',
     }
+    # Para textos comerciales y teléfono: cada línea es un ítem
     if label_key in line_items_labels:
-        return [line['text'] for line in _sorted_lines(lines) if line['text']]
+        items = [line['text'] for line in _sorted_lines(lines) if line['text'].strip()]
+        # REGLA OCR: Solo devolver lista si hay 2+ ítems
+        return items if len(items) >= 2 else []
     
     # Usar un umbral más estricto para detectar gaps entre párrafos
-    paragraphs = _paragraphs_from_lines(lines, max_gap_multiplier=1.2)
+    paragraphs = _paragraphs_from_lines(lines, max_gap_multiplier=1.3)
     
-    # Para etiquetas específicas, detectar mejor los límites
+    # Para etiquetas que DEBEN ser lista (si tienen 2+ ítems)
     if label_key in force_list_labels:
-        # Detectar si hay un gap grande que indica fin del contenido
         if paragraphs:
+            # Filtrar párrafos que pertenecen a otra sección
             filtered_paragraphs = []
             for i, para in enumerate(paragraphs):
                 para_text = ' '.join(para).strip()
-                # Detener si encontramos texto que claramente pertenece a otra sección
+                # Detener si encontramos texto de otra sección
                 if i > 0 and _looks_like_different_section(para_text, label_key):
                     break
                 filtered_paragraphs.append(para)
             
             if filtered_paragraphs:
                 items = _paragraphs_to_list_items(filtered_paragraphs)
+                # REGLA OCR: Solo devolver lista si hay 2+ ítems
                 if len(items) >= 2:
                     return items
     
+    # Heurística: si hay 2+ bloques separados
     if len(blocks) >= 2:
-        return [block['text'] for block in blocks if block['text']]
+        items = [block['text'] for block in blocks if block['text'].strip()]
+        if len(items) >= 2:
+            return items
+    
+    # Heurística: si hay 2+ párrafos
     if paragraphs and len(paragraphs) >= 2:
-        return _paragraphs_to_list_items(paragraphs)
-    if blocks:
+        items = _paragraphs_to_list_items(paragraphs)
+        if len(items) >= 2:
+            return items
+    
+    # Heurística: si un bloque tiene múltiples párrafos separados
+    if blocks and len(blocks) == 1:
         parts = _split_paragraphs(blocks[0]['text'])
         if len(parts) >= 2:
             return parts
-    if len(lines) >= 2:
+    
+    # Heurística: si hay muchas líneas cortas (>= 3 líneas)
+    if len(lines) >= 3:
         avg_len = sum(len(line['text']) for line in lines) / len(lines)
-        if avg_len <= 60:
-            return [line['text'] for line in lines if line['text']]
+        if avg_len <= 50:
+            items = [line['text'] for line in _sorted_lines(lines) if line['text'].strip()]
+            if len(items) >= 2:
+                return items
+    
+    # REGLA OCR: Si no hay 2+ ítems separados, NO es lista
     return []
 
 
 def _build_text_value(blocks: list, lines: list) -> str:
+    """
+    Construye valor de texto conservando saltos de línea.
+    REGLA OCR: Para Razón social, GDA, etc. conservar saltos de línea internos.
+    """
     paragraphs = _paragraphs_from_lines(lines)
     if paragraphs:
         return _paragraphs_to_text(paragraphs)
     if blocks:
-        return '\n\n'.join(block['text'] for block in blocks if block['text']).strip()
-    return '\n'.join(line['text'] for line in lines if line['text']).strip()
+        # Conservar saltos de línea entre bloques
+        return '\n\n'.join(block['text'] for block in blocks if block['text'].strip()).strip()
+    # Unir líneas con saltos de línea simples
+    return '\n'.join(line['text'] for line in _sorted_lines(lines) if line['text'].strip()).strip()
 
 
 def _table_headers_from_lines(lines: list) -> list:
@@ -760,18 +784,28 @@ def extract_pdf_fe(pdf_bytes: bytes) -> dict:
         _normalize_label_key('Information minimale sur l\'emballage'),
         _normalize_label_key('Informations minimales sur l\'emballage'),
     }
+    # Etiquetas que SIEMPRE deben ser texto (según prompt OCR)
     always_text_labels = {
-        _normalize_label_key('Razón social'),
-        _normalize_label_key('Marca de Identificación'),
-        _normalize_label_key('GDA'),
+        _normalize_label_key('Razón social'),  # bloque único con saltos de línea
+        _normalize_label_key('Razão social'),
+        _normalize_label_key('Marca de Identificación'),  # unir líneas con espacios
+        _normalize_label_key('Marca de Identificação'),
+        _normalize_label_key('GDA'),  # conservar saltos de línea exactos
+        _normalize_label_key('Denominación Comercial'),  # valor único
+        _normalize_label_key('Denominação Comercial'),
+        _normalize_label_key('Cantidad neta'),  # valor único
+        _normalize_label_key('Quantidade líquida'),
+        _normalize_label_key('Ingredientes a destacar'),  # valor único
     }
     # Etiquetas que típicamente tienen valores inline (a la derecha)
+    # REGLA OCR: estas etiquetas suelen tener su valor en la misma línea, a la derecha
     prefer_inline_labels = {
-        _normalize_label_key('Denominación Comercial'),
+        _normalize_label_key('Denominación Comercial'),  # valor único inline
         _normalize_label_key('Denominação Comercial'),
-        _normalize_label_key('Cantidad neta'),
+        _normalize_label_key('Cantidad neta'),  # ej: "75 g x 4"
         _normalize_label_key('Net quantity'),
         _normalize_label_key('Quantidade líquida'),
+        _normalize_label_key('Ingredientes a destacar'),  # ej: "Hígado de cerdo"
         _normalize_label_key('Ingredientes a destacar'),
     }
     table_labels = {
