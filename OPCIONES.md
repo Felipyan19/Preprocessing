@@ -41,7 +41,7 @@ Debes especificar **una** de estas opciones:
 | `small_text_sharp` | Detección de ESTRUCTURA (bordes gruesos) | Identificar líneas/celdas de tabla |
 | `ocr_preserve_details` ⭐ | Preserva detalles finos (suave) | OCR con símbolos (,.*<%) |
 | `ocr_ultra_fine` ⭐⭐ | CLAHE + bilateral + adaptive + morfología | OCR tradicional (Tesseract) |
-| `gemini_vision` ⭐⭐⭐ | **Ultra-alta resolución + escala de grises natural** | **Gemini/GPT-Vision/Claude (EVITA ALUCINACIONES)** |
+| `gemini_vision` ⭐⭐⭐ | **Escala de grises + filtros ultra-suaves** | **Gemini/GPT-Vision/Claude (EVITA ALUCINACIONES)** |
 | `minimal` | Mínimo procesamiento | Imágenes de alta calidad |
 
 ### Uso:
@@ -55,9 +55,13 @@ Debes especificar **una** de estas opciones:
 **⚠️ IMPORTANTE - Elige el preset según tu OCR:**
 
 ### Para Modelos Multimodales (Gemini, GPT-Vision, Claude):
-- **`gemini_vision`** ⭐⭐⭐: **SIN binarización**, escala de grises natural, máxima resolución (3200px)
-- Evita que el modelo **alucine números** (7,2 vs 7,1, 344 vs 342)
-- CLAHE ultra-suave (1.3) + deblur minimalista (0.2)
+- **`gemini_vision`** ⭐⭐⭐: **Escala de grises + filtros MUY suaves**
+  - ✅ Conversión a escala de grises (rojo → gris)
+  - ✅ CLAHE suave (clip_limit=1.5) para contraste de números finos
+  - ✅ Deblur ultra-suave (strength=0.3) para mejorar legibilidad
+  - ✅ Upscale con Lanczos4 (hasta 2000px)
+  - ❌ **SIN binarización** (evita alucinaciones)
+  - Reduce errores: 7,2 vs 7,1, 344 vs 342, pérdida de comas/símbolos
 
 ### Para OCR Tradicional (Tesseract):
 - **`ocr_ultra_fine`** ⭐⭐: Con binarización adaptativa + morfología
@@ -187,15 +191,18 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 
 ---
 
-### 🎨 Eliminación de Fondos
+### 🎨 Conversión y Eliminación de Fondos
 
 | Opción | Tipo | Default | Descripción |
 |--------|------|---------|-------------|
+| `convert_to_grayscale` | `boolean` | `false` | Convierte a escala de grises (rojo→gris, azul→gris, etc.) sin eliminar fondo ⭐ |
 | `remove_color_bg` | `boolean` | `true` | Elimina fondos de color (rojo, azul, verde, amarillo) |
 | `extract_white_text` | `boolean` | `false` | Extrae texto blanco de fondos de color |
 | `extract_text_adaptive` | `boolean` | `false` | Extracción adaptativa (funciona con texto claro u oscuro) |
 
-**Nota:** Solo una de estas opciones debe estar en `true` a la vez.
+**⭐ `convert_to_grayscale`:** Ideal para LLMs multimodales (Gemini/GPT-Vision) - preserva toda la información visual pero sin colores que puedan confundir al modelo.
+
+**Nota:** Solo una de `remove_color_bg`, `extract_white_text`, o `extract_text_adaptive` debe estar en `true` a la vez.
 
 **Ejemplo:**
 ```json
@@ -426,40 +433,41 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 }
 ```
 
-### `gemini_vision` ⭐⭐⭐ (NUEVO - PARA MODELOS MULTIMODALES)
+### `gemini_vision` ⭐⭐⭐ (EMPEZANDO DE CERO - PARA MODELOS MULTIMODALES)
 **🎯 Optimizado para Gemini/GPT-Vision/Claude:** Evita alucinaciones
-- **SIN binarización** (los LLM prefieren escala de grises natural)
-- Ultra-alta resolución (3200px) para preservar detalles finos
-- CLAHE ultra-suave (1.3) con tiles grandes (16x16)
-- Deblur minimalista (0.2) para NO engrosar trazos
-- Bilateral muy ligero (d=3, sigma=30)
-- **Resultado:** Gemini lee correctamente 7,2 (no 7,1), 344 kJ (no 342), <1% (no inventa)
+
+**Filosofía:** Minimalismo + Escala de grises natural
+- ✅ **Conversión a escala de grises** (rojo → gris, sin eliminar fondo)
+- ✅ **CLAHE suave** (1.5) para mejorar contraste de números finos (7,2 vs 7,1)
+- ✅ **Deblur ultra-suave** (0.3) para aumentar legibilidad sin engrosar
+- ✅ **Upscale con Lanczos4** (2000px) para preservar detalles
+- ❌ **SIN binarización** (los LLMs prefieren escala de grises natural)
+- ❌ **SIN denoise** (puede difuminar números pequeños)
+- ❌ **SIN sharpen** (puede crear artefactos que confunden al LLM)
+- **Resultado:** Gemini lee correctamente 7,2 (no 7,1), 344 kJ (no 342), <1% (no inventa), no pierde comas ni símbolos
 
 ```json
 {
   "smart_table_analysis": false,
   "upscale": true,
-  "min_size": 3200,
-  "max_scale": 4.0,
+  "min_size": 2000,
+  "max_scale": 3.0,
   "upscale_method": "lanczos4",
-  "denoise": true,
-  "denoise_method": "bilateral",
-  "bilateral_d": 3,
-  "bilateral_sigma_color": 30,
-  "bilateral_sigma_space": 30,
+  "convert_to_grayscale": true,
   "enhance_contrast": true,
-  "clip_limit": 1.3,
-  "clahe_tile_grid_size": [16, 16],
-  "remove_color_bg": true,
+  "clip_limit": 1.5,
+  "clahe_tile_grid_size": [8, 8],
   "deblur": true,
   "deblur_method": "unsharp",
-  "deblur_strength": 0.2,
+  "deblur_strength": 0.3,
+  "denoise": false,
+  "remove_color_bg": false,
   "sharpen": false,
   "binarize": false,
   "post_morphology": false,
-  "preserve_fine_details": true,
   "deskew": false,
-  "auto_invert": false
+  "auto_invert": false,
+  "preserve_fine_details": true
 }
 ```
 
