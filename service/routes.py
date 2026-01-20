@@ -38,7 +38,10 @@ def preprocess():
                                         #   - white_text_on_color
                                         #   - red_table_blurry (para fondo rojo + texto blanco borroso)
                                         #   - smart_auto (análisis inteligente automático)
-                                        #   - small_text_sharp (NUEVO: para texto MUY pequeño y pegado)
+                                        #   - small_text_sharp (para detección de estructura)
+                                        #   - ocr_preserve_details (preserva detalles finos)
+                                        #   - ocr_ultra_fine (CLAHE+bilateral+adaptive+morfología)
+                                        #   - gemini_vision (NUEVO⭐: para Gemini/GPT-Vision/Claude)
                                         #   - minimal
         
         # Opciones directas (sin anidación):
@@ -154,20 +157,93 @@ def preprocess():
                     'deblur_method': 'unsharp',
                 }
             elif preset == 'small_text_sharp':
-                # NUEVO: Optimizado para texto MUY PEQUEÑO y PEGADO (tablas con letra diminuta)
-                # Configuración basada en pruebas reales - da excelentes resultados
+                # Para DETECCIÓN DE ESTRUCTURA de tabla (bordes, líneas)
+                # ADVERTENCIA: Puede engrosar trazos y perder detalles finos para OCR
                 options = {
                     'smart_table_analysis': True,
                     'upscale': True,
-                    'min_size': 2000,  # Escala optimizada para texto pequeño
+                    'min_size': 2000,
                     'max_scale': 5.0,
                     'upscale_method': 'lanczos4',
                     'deblur': True,
                     'deblur_method': 'aggressive',
-                    'deblur_strength': 1.0,  # Balanceado para bordes finos
+                    'deblur_strength': 1.0,
                     'sharpen': True,
-                    'sharpen_strength': 0.5,  # Suave para evitar bordes gruesos
+                    'sharpen_strength': 0.5,
                     'sharpen_method': 'unsharp',
+                    'preserve_fine_details': True,
+                }
+            elif preset == 'ocr_preserve_details':
+                # NUEVO: Para OCR de texto/números - PRESERVA detalles finos
+                # Optimizado para mantener comas, puntos, símbolos (<, %, *, etc.)
+                # Menos procesamiento = menos distorsión
+                options = {
+                    'smart_table_analysis': True,
+                    'upscale': True,
+                    'min_size': 1800,
+                    'max_scale': 4.0,
+                    'upscale_method': 'lanczos4',
+                    'deblur': True,
+                    'deblur_method': 'unsharp',  # Menos agresivo que aggressive
+                    'deblur_strength': 0.6,  # Muy suave
+                    'sharpen': False,  # Sin sharpening extra para no engrosar
+                    'preserve_fine_details': True,
+                }
+            elif preset == 'ocr_ultra_fine':
+                # NUEVO: Ultra-optimizado para OCR con parámetros granulares
+                # Basado en feedback: CLAHE + bilateral + adaptive threshold + morfología
+                # Ideal para tablas nutricionales con texto muy pequeño
+                options = {
+                    'smart_table_analysis': False,  # Control manual total
+                    'upscale': True,
+                    'min_size': 2400,
+                    'max_scale': 3.0,
+                    'upscale_method': 'lanczos4',
+                    'denoise': True,
+                    'denoise_method': 'bilateral',
+                    'bilateral_d': 5,
+                    'bilateral_sigma_color': 50,
+                    'bilateral_sigma_space': 50,
+                    'enhance_contrast': True,
+                    'clip_limit': 1.8,
+                    'clahe_tile_grid_size': [8, 8],
+                    'remove_color_bg': True,
+                    'deblur': True,
+                    'deblur_method': 'unsharp',
+                    'deblur_strength': 0.35,
+                    'sharpen': False,
+                    'binarize': True,
+                    'binarize_method': 'adaptive_gaussian',
+                    'adaptive_block_size': 51,
+                    'adaptive_C': 9,
+                    'post_morphology': True,
+                    'morphology_mode': 'open',
+                    'morphology_kernel': [2, 2],
+                    'morphology_iterations': 1,
+                    'preserve_fine_details': True,
+                    'deskew': False,
+                    'auto_invert': False,
+                }
+            elif preset == 'gemini_vision':
+                # EMPEZANDO DE CERO: Solo escala de grises + upscale
+                options = {
+                    'smart_table_analysis': False,
+                    'upscale': True,
+                    'min_size': 2000,
+                    'max_scale': 3.0,
+                    'upscale_method': 'lanczos4',
+                    'convert_to_grayscale': True,
+                    'denoise': False,
+                    'enhance_contrast': False,
+                    'remove_color_bg': False,
+                    'deblur': False,
+                    'sharpen': False,
+                    'binarize': False,
+                    'post_morphology': False,
+                    'deskew': False,
+                    'auto_invert': False,
+                    'extract_white_text': False,
+                    'extract_text_adaptive': False,
                     'preserve_fine_details': True,
                 }
             elif preset == 'minimal':
@@ -344,20 +420,94 @@ def preprocess_image():
                     'deblur_method': 'unsharp',
                 }
             elif preset == 'small_text_sharp':
-                # NUEVO: Optimizado para texto MUY PEQUEÑO y PEGADO (tablas con letra diminuta)
-                # Configuración basada en pruebas reales - da excelentes resultados
+                # Para DETECCIÓN DE ESTRUCTURA de tabla (bordes, líneas)
+                # ADVERTENCIA: Puede engrosar trazos y perder detalles finos para OCR
                 options = {
                     'smart_table_analysis': True,
                     'upscale': True,
-                    'min_size': 2000,  # Escala optimizada para texto pequeño
+                    'min_size': 2000,
                     'max_scale': 5.0,
                     'upscale_method': 'lanczos4',
                     'deblur': True,
                     'deblur_method': 'aggressive',
-                    'deblur_strength': 1.0,  # Balanceado para bordes finos
+                    'deblur_strength': 1.0,
                     'sharpen': True,
-                    'sharpen_strength': 0.5,  # Suave para evitar bordes gruesos
+                    'sharpen_strength': 0.5,
                     'sharpen_method': 'unsharp',
+                    'preserve_fine_details': True,
+                }
+            elif preset == 'ocr_preserve_details':
+                # NUEVO: Para OCR de texto/números - PRESERVA detalles finos
+                # Optimizado para mantener comas, puntos, símbolos (<, %, *, etc.)
+                # Menos procesamiento = menos distorsión
+                options = {
+                    'smart_table_analysis': True,
+                    'upscale': True,
+                    'min_size': 1800,
+                    'max_scale': 4.0,
+                    'upscale_method': 'lanczos4',
+                    'deblur': True,
+                    'deblur_method': 'unsharp',  # Menos agresivo que aggressive
+                    'deblur_strength': 0.6,  # Muy suave
+                    'sharpen': False,  # Sin sharpening extra para no engrosar
+                    'preserve_fine_details': True,
+                }
+            elif preset == 'ocr_ultra_fine':
+                # NUEVO: Ultra-optimizado con parámetros granulares
+                options = {
+                    'smart_table_analysis': False,
+                    'upscale': True,
+                    'min_size': 2400,
+                    'max_scale': 3.0,
+                    'upscale_method': 'lanczos4',
+                    'denoise': True,
+                    'denoise_method': 'bilateral',
+                    'bilateral_d': 5,
+                    'bilateral_sigma_color': 50,
+                    'bilateral_sigma_space': 50,
+                    'enhance_contrast': True,
+                    'clip_limit': 1.8,
+                    'clahe_tile_grid_size': [8, 8],
+                    'remove_color_bg': True,
+                    'deblur': True,
+                    'deblur_method': 'unsharp',
+                    'deblur_strength': 0.35,
+                    'sharpen': False,
+                    'binarize': True,
+                    'binarize_method': 'adaptive_gaussian',
+                    'adaptive_block_size': 51,
+                    'adaptive_C': 9,
+                    'post_morphology': True,
+                    'morphology_mode': 'open',
+                    'morphology_kernel': [2, 2],
+                    'morphology_iterations': 1,
+                    'preserve_fine_details': True,
+                    'deskew': False,
+                    'auto_invert': False,
+                }
+            elif preset == 'gemini_vision':
+                # EMPEZANDO DE CERO: Solo escala de grises + upscale
+                # Rojo → Gris, sin otros filtros
+                options = {
+                    'smart_table_analysis': False,  # Sin análisis automático
+                    'upscale': True,
+                    'min_size': 2000,
+                    'max_scale': 3.0,
+                    'upscale_method': 'lanczos4',
+                    # Convertir a escala de grises (rojo → gris)
+                    'convert_to_grayscale': True,
+                    # TODOS los demás filtros DESACTIVADOS
+                    'denoise': False,
+                    'enhance_contrast': False,
+                    'remove_color_bg': False,
+                    'deblur': False,
+                    'sharpen': False,
+                    'binarize': False,
+                    'post_morphology': False,
+                    'deskew': False,
+                    'auto_invert': False,
+                    'extract_white_text': False,
+                    'extract_text_adaptive': False,
                     'preserve_fine_details': True,
                 }
             elif preset == 'minimal':

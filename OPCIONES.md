@@ -38,18 +38,31 @@ Debes especificar **una** de estas opciones:
 | `white_text_on_color` | Optimizado para texto claro sobre fondos de color | Fondos azules, verdes, rojos |
 | `red_table_blurry` ⭐ | Pipeline especializado para fondo rojo + texto blanco borroso | Tablas nutricionales |
 | `smart_auto` | Detección automática inteligente | Cuando no sabes qué preset usar |
-| `small_text_sharp` ⭐⭐ | Escalado agresivo + deblur + sharpening para texto diminuto | Tablas con letra muy pequeña y pegada |
+| `small_text_sharp` | Detección de ESTRUCTURA (bordes gruesos) | Identificar líneas/celdas de tabla |
+| `ocr_preserve_details` ⭐ | Preserva detalles finos (suave) | OCR con símbolos (,.*<%) |
+| `ocr_ultra_fine` ⭐⭐ | CLAHE + bilateral + adaptive + morfología | OCR tradicional (Tesseract) |
+| `gemini_vision` ⭐⭐⭐ | **Ultra-alta resolución + escala de grises natural** | **Gemini/GPT-Vision/Claude (EVITA ALUCINACIONES)** |
 | `minimal` | Mínimo procesamiento | Imágenes de alta calidad |
 
 ### Uso:
 ```json
 {
   "image_url": "https://...",
-  "preset": "small_text_sharp"
+  "preset": "ocr_preserve_details"
 }
 ```
 
-**Nota:** Para texto muy pequeño y borroso, usa `small_text_sharp` en lugar de `red_table_blurry`.
+**⚠️ IMPORTANTE - Elige el preset según tu OCR:**
+
+### Para Modelos Multimodales (Gemini, GPT-Vision, Claude):
+- **`gemini_vision`** ⭐⭐⭐: **SIN binarización**, escala de grises natural, máxima resolución (3200px)
+- Evita que el modelo **alucine números** (7,2 vs 7,1, 344 vs 342)
+- CLAHE ultra-suave (1.3) + deblur minimalista (0.2)
+
+### Para OCR Tradicional (Tesseract):
+- **`ocr_ultra_fine`** ⭐⭐: Con binarización adaptativa + morfología
+- **`ocr_preserve_details`**: Más suave
+- **`small_text_sharp`**: Para detectar estructura (puede perder detalles)
 
 ---
 
@@ -377,21 +390,118 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 }
 ```
 
-### `small_text_sharp` ⭐⭐ (NUEVO)
+### `small_text_sharp` (Detección de Estructura)
+**⚠️ Advertencia:** Engrosa bordes, puede perder detalles finos. Úsalo solo para detectar líneas/celdas.
 ```json
 {
   "smart_table_analysis": true,
   "upscale": true,
-  "min_size": 1500,
+  "min_size": 2000,
   "max_scale": 5.0,
   "upscale_method": "lanczos4",
   "deblur": true,
   "deblur_method": "aggressive",
-  "deblur_strength": 1.5,
+  "deblur_strength": 1.0,
   "sharpen": true,
-  "sharpen_strength": 0.8,
+  "sharpen_strength": 0.5,
   "sharpen_method": "unsharp",
   "preserve_fine_details": true
+}
+```
+
+### `ocr_preserve_details` ⭐ (Suave)
+**✅ Para OCR:** Preserva comas, puntos, símbolos (<, %, *, etc.)
+```json
+{
+  "smart_table_analysis": true,
+  "upscale": true,
+  "min_size": 1800,
+  "max_scale": 4.0,
+  "upscale_method": "lanczos4",
+  "deblur": true,
+  "deblur_method": "unsharp",
+  "deblur_strength": 0.6,
+  "sharpen": false,
+  "preserve_fine_details": true
+}
+```
+
+### `gemini_vision` ⭐⭐⭐ (NUEVO - PARA MODELOS MULTIMODALES)
+**🎯 Optimizado para Gemini/GPT-Vision/Claude:** Evita alucinaciones
+- **SIN binarización** (los LLM prefieren escala de grises natural)
+- Ultra-alta resolución (3200px) para preservar detalles finos
+- CLAHE ultra-suave (1.3) con tiles grandes (16x16)
+- Deblur minimalista (0.2) para NO engrosar trazos
+- Bilateral muy ligero (d=3, sigma=30)
+- **Resultado:** Gemini lee correctamente 7,2 (no 7,1), 344 kJ (no 342), <1% (no inventa)
+
+```json
+{
+  "smart_table_analysis": false,
+  "upscale": true,
+  "min_size": 3200,
+  "max_scale": 4.0,
+  "upscale_method": "lanczos4",
+  "denoise": true,
+  "denoise_method": "bilateral",
+  "bilateral_d": 3,
+  "bilateral_sigma_color": 30,
+  "bilateral_sigma_space": 30,
+  "enhance_contrast": true,
+  "clip_limit": 1.3,
+  "clahe_tile_grid_size": [16, 16],
+  "remove_color_bg": true,
+  "deblur": true,
+  "deblur_method": "unsharp",
+  "deblur_strength": 0.2,
+  "sharpen": false,
+  "binarize": false,
+  "post_morphology": false,
+  "preserve_fine_details": true,
+  "deskew": false,
+  "auto_invert": false
+}
+```
+
+### `ocr_ultra_fine` ⭐⭐ (Para Tesseract OCR)
+**🎯 Para OCR tradicional:** Control granular total
+- CLAHE suave (1.8) para contraste local sin "quemar"
+- Bilateral denoise (d=5) para suavizar sin difuminar
+- Unsharp muy bajo (0.35) para evitar engrosar bordes
+- Adaptive threshold (blockSize=51, C=9) mantiene comas y símbolos
+- Morfología (open 2x2) elimina ruido pequeño
+
+```json
+{
+  "smart_table_analysis": false,
+  "upscale": true,
+  "min_size": 2400,
+  "max_scale": 3.0,
+  "upscale_method": "lanczos4",
+  "denoise": true,
+  "denoise_method": "bilateral",
+  "bilateral_d": 5,
+  "bilateral_sigma_color": 50,
+  "bilateral_sigma_space": 50,
+  "enhance_contrast": true,
+  "clip_limit": 1.8,
+  "clahe_tile_grid_size": [8, 8],
+  "remove_color_bg": true,
+  "deblur": true,
+  "deblur_method": "unsharp",
+  "deblur_strength": 0.35,
+  "sharpen": false,
+  "binarize": true,
+  "binarize_method": "adaptive_gaussian",
+  "adaptive_block_size": 51,
+  "adaptive_C": 9,
+  "post_morphology": true,
+  "morphology_mode": "open",
+  "morphology_kernel": [2, 2],
+  "morphology_iterations": 1,
+  "preserve_fine_details": true,
+  "deskew": false,
+  "auto_invert": false
 }
 ```
 
@@ -462,32 +572,28 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 }
 ```
 
-### Ejemplo 6: Tabla con Texto MUY Pequeño y Pegado ⭐⭐
+### Ejemplo 6: OCR de Tabla Nutricional (con símbolos y números) ⭐⭐
+**✅ RECOMENDADO:** Para extraer texto con OCR
 ```json
 {
-  "image_url": "https://example.com/tabla-texto-pequeno.jpg",
+  "image_url": "https://example.com/tabla-nutricional.pdf",
+  "preset": "ocr_preserve_details"
+}
+```
+
+**Preserva:** Comas (7,2), símbolos (<1%), asteriscos (*), porcentajes (0,1%)
+
+### Ejemplo 7: Detectar Líneas/Celdas de Tabla
+**⚠️ Solo para detección de estructura** (no para OCR)
+```json
+{
+  "image_url": "https://example.com/tabla-compleja.jpg",
   "preset": "small_text_sharp"
 }
 ```
 
-**O configuración manual avanzada:**
-```json
-{
-  "image_url": "https://example.com/tabla-texto-pequeno.jpg",
-  "smart_table_analysis": true,
-  "upscale": true,
-  "min_size": 1500,
-  "max_scale": 5.0,
-  "upscale_method": "lanczos4",
-  "deblur": true,
-  "deblur_method": "aggressive",
-  "deblur_strength": 1.5,
-  "sharpen": true,
-  "sharpen_strength": 0.8,
-  "sharpen_method": "unsharp",
-  "preserve_fine_details": true
-}
-```
+**Ventaja:** Bordes más gruesos y definidos  
+**Desventaja:** Puede perder detalles finos (comas, puntos, símbolos)
 
 ---
 
@@ -535,13 +641,28 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 - Activa `deblur: true` si el texto está borroso
 - Aumenta `min_size` a 1000-1200 para mejor calidad
 
-### Para Texto MUY Pequeño y Pegado ⭐⭐
-- Usa `preset: "small_text_sharp"` (¡RECOMENDADO!)
-- O configura manualmente:
-  - `upscale_method: "lanczos4"` + `min_size: 1500` + `max_scale: 5.0`
-  - `deblur: true` + `deblur_method: "aggressive"` + `deblur_strength: 1.5`
-  - `sharpen: true` + `sharpen_method: "unsharp"` + `sharpen_strength: 0.8`
-  - `preserve_fine_details: true`
+### Para Gemini/GPT-Vision/Claude ⭐⭐⭐ (MEJOR)
+- **Usa `preset: "gemini_vision"`** (¡RECOMENDADO!)
+- Específicamente diseñado para evitar que los LLM alucinen
+- SIN binarización (escala de grises natural)
+- Ultra-alta resolución (3200px) + procesamiento mínimo
+- Gemini lee correctamente: 7,2 (no 7,1), 344 kJ (no 342), <1% (no inventa)
+
+### Para OCR Tradicional (Tesseract)
+- **Usa `preset: "ocr_ultra_fine"`**
+- Control granular: CLAHE suave + bilateral + adaptive threshold + morfología
+- Evita engrosar trazos (deblur_strength: 0.35)
+- Mantiene comas (7,2), símbolos (<1%), asteriscos (*)
+
+### Para OCR General (menos agresivo)
+- **Usa `preset: "ocr_preserve_details"`**
+- Más suave, menos procesamiento
+- Bueno para imágenes de mejor calidad
+
+### Para Detectar Estructura/Líneas de Tabla
+- Usa `preset: "small_text_sharp"` 
+- Mejor para table detection
+- ⚠️ Advertencia: Puede engrosar trazos y perder detalles finos
 
 ### Para Documentos Estándar
 - Usa `preset: "table_ocr"` (default)

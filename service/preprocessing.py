@@ -10,14 +10,20 @@ logger = logging.getLogger(__name__)
 # OPERACIONES DE PREPROCESAMIENTO
 # ============================================
 
-def enhance_contrast_clahe(img: np.ndarray, clip_limit: float = 3.0) -> np.ndarray:
-    """CLAHE - muy efectivo para texto blanco sobre fondos de color."""
+def enhance_contrast_clahe(img: np.ndarray, clip_limit: float = 3.0, tile_grid_size: tuple = (8, 8)) -> np.ndarray:
+    """
+    CLAHE - muy efectivo para texto blanco sobre fondos de color.
+    
+    Args:
+        clip_limit: Límite de contraste (1.0-5.0). Más bajo = más suave.
+        tile_grid_size: Tamaño de la cuadrícula (default 8x8)
+    """
     if len(img.shape) == 2:
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
         return clahe.apply(img)
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
     l = clahe.apply(l)
     return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
@@ -129,20 +135,41 @@ def extract_text_adaptive(img: np.ndarray) -> np.ndarray:
     return binary
 
 
-def adaptive_binarize(img: np.ndarray, method: str = 'otsu') -> np.ndarray:
-    """Binarizacion adaptativa."""
+def adaptive_binarize(img: np.ndarray, method: str = 'otsu', block_size: int = 11, C: int = 2) -> np.ndarray:
+    """
+    Binarización adaptativa.
+    
+    Args:
+        method: 'otsu', 'adaptive_gaussian', 'adaptive_mean'
+        block_size: Tamaño del bloque para adaptive (debe ser impar). Más grande = más suave.
+        C: Constante que se resta del promedio. Más alto = más conservador.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
 
     if method == 'otsu':
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     elif method == 'adaptive_gaussian':
+        # Asegurar que block_size es impar
+        if block_size % 2 == 0:
+            block_size += 1
         binary = cv2.adaptiveThreshold(
             gray,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            11,
-            2,
+            block_size,
+            C,
+        )
+    elif method == 'adaptive_mean':
+        if block_size % 2 == 0:
+            block_size += 1
+        binary = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY,
+            block_size,
+            C,
         )
     else:
         _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
@@ -186,12 +213,20 @@ def deskew_image(img: np.ndarray) -> np.ndarray:
     )
 
 
-def denoise_image(img: np.ndarray, method: str = 'bilateral') -> np.ndarray:
-    """Reduce ruido."""
+def denoise_image(img: np.ndarray, method: str = 'bilateral', d: int = 9, sigma_color: float = 75, sigma_space: float = 75) -> np.ndarray:
+    """
+    Reduce ruido.
+    
+    Args:
+        method: 'bilateral', 'gaussian', 'nlm'
+        d: Diámetro del filtro bilateral (5-9 típico)
+        sigma_color: Filtro en espacio de color (más bajo = más selectivo)
+        sigma_space: Filtro en espacio de coordenadas
+    """
     if method == 'gaussian':
         return cv2.GaussianBlur(img, (5, 5), 0)
     if method == 'bilateral':
-        return cv2.bilateralFilter(img, 9, 75, 75)
+        return cv2.bilateralFilter(img, d, sigma_color, sigma_space)
     if method == 'nlm':
         if len(img.shape) == 3:
             return cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
@@ -303,6 +338,29 @@ def invert_if_dark(img: np.ndarray) -> np.ndarray:
         logger.info("Invirtiendo imagen (fondo oscuro)")
         return cv2.bitwise_not(img)
     return img
+
+
+def apply_morphology(img: np.ndarray, mode: str = 'open', kernel_size: tuple = (2, 2), iterations: int = 1) -> np.ndarray:
+    """
+    Aplica operaciones morfológicas para limpiar la imagen binarizada.
+    
+    Args:
+        mode: 'open' (elimina ruido pequeño), 'close' (rellena huecos), 'erode', 'dilate'
+        kernel_size: Tamaño del kernel (ancho, alto)
+        iterations: Número de veces que se aplica la operación
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+    
+    if mode == 'open':
+        return cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel, iterations=iterations)
+    elif mode == 'close':
+        return cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+    elif mode == 'erode':
+        return cv2.erode(img, kernel, iterations=iterations)
+    elif mode == 'dilate':
+        return cv2.dilate(img, kernel, iterations=iterations)
+    else:
+        return img
 
 
 # ============================================
@@ -705,8 +763,9 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         applied.append(f'upscale_{scale:.1f}x')
 
     if options.get('enhance_contrast', True):
-        result = enhance_contrast_clahe(result, options.get('clip_limit', 3.0))
-        applied.append('clahe')
+        tile_grid = tuple(options.get('clahe_tile_grid_size', [8, 8]))
+        result = enhance_contrast_clahe(result, options.get('clip_limit', 3.0), tile_grid)
+        applied.append(f'clahe_{options.get("clip_limit", 3.0)}')
 
     if options.get('extract_white_text', False):
         result = extract_text_from_colored_bg(result)
@@ -727,19 +786,38 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         if len(result.shape) == 2:
             result = cv2.medianBlur(result, 3)
         else:
-            result = denoise_image(result, denoise_method)
-        applied.append('denoise')
+            d = options.get('bilateral_d', 9)
+            sigma_color = options.get('bilateral_sigma_color', 75)
+            sigma_space = options.get('bilateral_sigma_space', 75)
+            result = denoise_image(result, denoise_method, d, sigma_color, sigma_space)
+        applied.append(f'denoise_{denoise_method}')
 
     if options.get('sharpen', False) and len(result.shape) == 3:
         result = sharpen_image(result, options.get('sharpen_strength', 1.0))
         applied.append('sharpen')
 
     if options.get('binarize', False) and len(result.shape) == 3:
-        result = adaptive_binarize(result, options.get('binarize_method', 'otsu'))
-        applied.append('binarize')
+        block_size = options.get('adaptive_block_size', 11)
+        C = options.get('adaptive_C', 2)
+        result = adaptive_binarize(result, options.get('binarize_method', 'otsu'), block_size, C)
+        applied.append(f'binarize_{options.get("binarize_method", "otsu")}')
+
+    # Morfología post-procesamiento
+    if options.get('post_morphology', False) and len(result.shape) == 2:
+        morph_mode = options.get('morphology_mode', 'open')
+        kernel_size = tuple(options.get('morphology_kernel', [2, 2]))
+        iterations = options.get('morphology_iterations', 1)
+        result = apply_morphology(result, morph_mode, kernel_size, iterations)
+        applied.append(f'morph_{morph_mode}')
 
     if options.get('auto_invert', True) and len(result.shape) == 3:
         result = invert_if_dark(result)
+
+    # Conversión a escala de grises si está activada
+    if options.get('convert_to_grayscale', False) and len(result.shape) == 3:
+        result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+        applied.append('convert_to_grayscale')
+        logger.info("Convertido a escala de grises")
 
     metadata['applied_operations'] = applied
     logger.info("Aplicado: %s", applied)
