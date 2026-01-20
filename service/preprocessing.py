@@ -762,24 +762,41 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         result = upscale_image(result, scale)
         applied.append(f'upscale_{scale:.1f}x')
 
+    # IMPORTANTE: Convertir a escala de grises ANTES de los filtros (si está activado)
+    # Esto evita que CLAHE blanquee la imagen a color
+    if options.get('convert_to_grayscale', False) and len(result.shape) == 3:
+        result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+        applied.append('convert_to_grayscale')
+        logger.info("Convertido a escala de grises ANTES de filtros")
+
     if options.get('enhance_contrast', True):
         tile_grid = tuple(options.get('clahe_tile_grid_size', [8, 8]))
         result = enhance_contrast_clahe(result, options.get('clip_limit', 3.0), tile_grid)
         applied.append(f'clahe_{options.get("clip_limit", 3.0)}')
 
-    if options.get('extract_white_text', False):
-        result = extract_text_from_colored_bg(result)
-        applied.append('extract_white_text')
-    elif options.get('extract_text_adaptive', False):
-        result = extract_text_adaptive(result)
-        applied.append('extract_text_adaptive')
-    elif options.get('remove_color_bg', True):
-        result = remove_color_background(result)
-        applied.append('remove_color_bg')
+    # Solo procesar color si NO se convirtió a escala de grises
+    if not options.get('convert_to_grayscale', False):
+        if options.get('extract_white_text', False):
+            result = extract_text_from_colored_bg(result)
+            applied.append('extract_white_text')
+        elif options.get('extract_text_adaptive', False):
+            result = extract_text_adaptive(result)
+            applied.append('extract_text_adaptive')
+        elif options.get('remove_color_bg', True):
+            result = remove_color_background(result)
+            applied.append('remove_color_bg')
 
     if options.get('deskew', True):
         result = deskew_image(result)
         applied.append('deskew')
+
+    # Deblur (antes de denoise para mejor resultado)
+    if options.get('deblur', False):
+        deblur_method = options.get('deblur_method', 'unsharp')
+        deblur_strength = options.get('deblur_strength', 1.0)
+        result = deblur_image(result, deblur_method, deblur_strength)
+        applied.append(f'deblur_{deblur_method}_{deblur_strength}')
+        logger.info("Aplicado deblurring: %s, strength: %.1f", deblur_method, deblur_strength)
 
     if options.get('denoise', True):
         denoise_method = options.get('denoise_method', 'bilateral')
@@ -813,11 +830,8 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
     if options.get('auto_invert', True) and len(result.shape) == 3:
         result = invert_if_dark(result)
 
-    # Conversión a escala de grises si está activada
-    if options.get('convert_to_grayscale', False) and len(result.shape) == 3:
-        result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-        applied.append('convert_to_grayscale')
-        logger.info("Convertido a escala de grises")
+    # Nota: convert_to_grayscale se movió al INICIO del pipeline (línea ~768)
+    # para que los filtros procesen la imagen gris desde el principio
 
     metadata['applied_operations'] = applied
     logger.info("Aplicado: %s", applied)
