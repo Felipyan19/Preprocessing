@@ -233,16 +233,16 @@ def preprocess():
                     'auto_invert': False,
                 }
             elif preset == 'gemini_vision':
-                # SIMPLE: Solo escala de grises + contraste + rotación/inversión automática
+                # SIMPLE: Solo escala de grises + contraste + zoom leve + rotación/inversión automática
                 # Optimizado para Gemini 2.5 Pro (mantiene imagen natural)
                 options = {
                     'smart_table_analysis': False,  # Sin análisis automático de estrategias
-                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
-                    'auto_crop_threshold': 0.85,  # (solo si se activa manualmente)
+                    'auto_crop_table': True,  # Zoom leve y conservador
+                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
                     'rotate_180': False,  # Cambiar a true si la imagen está al revés
                     'upscale': True,
-                    'min_size': 1800,  # Un poco más grande para mejor legibilidad
-                    'max_scale': 3.0,
+                    'min_size': 2000,  # Más grande para mantener calidad después del zoom
+                    'max_scale': 3.5,
                     'upscale_method': 'lanczos4',
                     # Convertir a escala de grises (rojo → gris)
                     'convert_to_grayscale': True,
@@ -269,12 +269,12 @@ def preprocess():
                 # Igual a gemini_vision pero ROTA 180° primero (para imágenes al revés)
                 options = {
                     'smart_table_analysis': False,
-                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
-                    'auto_crop_threshold': 0.85,
+                    'auto_crop_table': True,  # Zoom leve y conservador
+                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
                     'rotate_180': True,  # ROTACIÓN 180°
                     'upscale': True,
-                    'min_size': 1800,
-                    'max_scale': 3.0,
+                    'min_size': 2000,  # Más grande para mantener calidad
+                    'max_scale': 3.5,
                     'upscale_method': 'lanczos4',
                     'convert_to_grayscale': True,
                     'enhance_contrast': True,
@@ -538,16 +538,16 @@ def preprocess_image():
                     'auto_invert': False,
                 }
             elif preset == 'gemini_vision':
-                # SIMPLE: Solo escala de grises + contraste + rotación/inversión automática
+                # SIMPLE: Solo escala de grises + contraste + zoom leve + rotación/inversión automática
                 # Optimizado para Gemini 2.5 Pro (mantiene imagen natural)
                 options = {
                     'smart_table_analysis': False,  # Sin análisis automático de estrategias
-                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
-                    'auto_crop_threshold': 0.85,  # (solo si se activa manualmente)
+                    'auto_crop_table': True,  # Zoom leve y conservador
+                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
                     'rotate_180': False,  # Cambiar a true si la imagen está al revés
                     'upscale': True,
-                    'min_size': 1800,  # Un poco más grande para mejor legibilidad
-                    'max_scale': 3.0,
+                    'min_size': 2000,  # Más grande para mantener calidad después del zoom
+                    'max_scale': 3.5,
                     'upscale_method': 'lanczos4',
                     # Convertir a escala de grises (rojo → gris)
                     'convert_to_grayscale': True,
@@ -574,12 +574,12 @@ def preprocess_image():
                 # Igual a gemini_vision pero ROTA 180° primero (para imágenes al revés)
                 options = {
                     'smart_table_analysis': False,
-                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
-                    'auto_crop_threshold': 0.85,
+                    'auto_crop_table': True,  # Zoom leve y conservador
+                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
                     'rotate_180': True,  # ROTACIÓN 180°
                     'upscale': True,
-                    'min_size': 1800,
-                    'max_scale': 3.0,
+                    'min_size': 2000,  # Más grande para mantener calidad
+                    'max_scale': 3.5,
                     'upscale_method': 'lanczos4',
                     'convert_to_grayscale': True,
                     'enhance_contrast': True,
