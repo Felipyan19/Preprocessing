@@ -11,6 +11,8 @@ from .image_io import (
     decode_base64_image,
     download_image_from_url,
     encode_image_to_base64,
+    extract_images_with_headers,
+    is_pdf,
 )
 from .preprocessing import preprocess_for_table_ocr
 from .temp_files import cleanup_expired_files, get_temp_file, save_temp_file
@@ -197,7 +199,9 @@ def preprocess_image():
         "upscale": false,               # Aumentar resolución de imagen (default: false)
         "upscale_factor": 2.0,          # Factor de escala (ej: 2.0 = 2x) (opcional)
         "upscale_width": 6000,          # Ancho objetivo en píxeles (opcional)
-        "upscale_height": 8000           # Alto objetivo en píxeles (opcional)
+        "upscale_height": 8000,         # Alto objetivo en píxeles (opcional)
+        "skip_upscale_if_legible": true, # Omitir upscale si el texto ya es legible (default: true) ⭐ RECOMENDADO
+        "max_dimension": 5000           # Dimensión máxima permitida para evitar errores de Azure DI (default: 5000px) ⭐ IMPORTANTE
     }
     
     Respuesta (si return_url=true):
@@ -276,6 +280,22 @@ def preprocess_image():
 
         # Procesar imagen
         processed, metadata = preprocess_for_table_ocr(img, options)
+        
+        # Validar dimensiones finales para evitar errores de Azure DI
+        final_h, final_w = processed.shape[:2]
+        if final_w > 7000 or final_h > 7000:
+            logger.warning(
+                "ADVERTENCIA: Dimensiones procesadas (%dx%d) exceden límites seguros de Azure DI (7000px). "
+                "Esto puede causar error 'InvalidContentDimensions'. "
+                "Considera reducir upscale o usar crop de tabla.",
+                final_w, final_h
+            )
+        elif final_w > 5000 or final_h > 5000:
+            logger.info(
+                "Dimensiones procesadas (%dx%d) están cerca del límite recomendado de Azure DI (5000px). "
+                "Si recibes errores, considera reducir upscale.",
+                final_w, final_h
+            )
         
         # Obtener DPI del request (por defecto 300 DPI)
         dpi = int(data.get('dpi', 300))
@@ -395,4 +415,213 @@ def preprocess_image():
         return jsonify({'success': False, 'error': str(exc)}), 400
     except Exception as exc:
         logger.error("Error interno en preprocess-image: %s", exc, exc_info=True)
+        return jsonify({'success': False, 'error': f'Error interno del servidor: {str(exc)}'}), 500
+
+
+@api.route('/extract-pdf-images', methods=['POST'])
+def extract_pdf_images():
+    """
+    POST /extract-pdf-images
+    
+    Extrae todas las imágenes de un PDF junto con sus headers (texto arriba de cada imagen).
+    
+    Puedes enviar el PDF de tres formas:
+    1. Archivo directo (multipart/form-data): campo 'pdf_file'
+    2. URL: JSON con "pdf_url"
+    3. Base64: JSON con "pdf_base64"
+    
+    Body (multipart/form-data o JSON):
+        "pdf_file": <archivo PDF>,      # Archivo PDF subido directamente (opcional)
+        "pdf_url": "https://...",       # URL del PDF (opcional)
+        "pdf_base64": "base64...",      # PDF en base64 (opcional)
+        "header_distance_threshold": 50.0,  # Distancia máxima para considerar texto como header (default: 50)
+        "return_url": true,              # Si true, devuelve URLs temporales; si false, devuelve base64 (default: true)
+        "format": "png",                 # Formato de salida: "png" (default), "jpg", "jpeg", "webp"
+        "expiry_seconds": 3600          # Tiempo de expiración de URLs en segundos (default: 3600)
+    }
+    
+    Respuesta (si return_url=true):
+    {
+        "success": true,
+        "total_images": 3,
+        "images": [
+            {
+                "index": 0,
+                "page": 0,
+                "header": "Título de la imagen",
+                "image_url": "http://localhost:5050/download/<file_id>",
+                "file_id": "<file_id>",
+                "width": 800,
+                "height": 600,
+                "bbox": {"x0": 100, "y0": 200, "x1": 900, "y1": 800},
+                "format": "png"
+            },
+            ...
+        ]
+    }
+    
+    Respuesta (si return_url=false):
+    {
+        "success": true,
+        "total_images": 3,
+        "images": [
+            {
+                "index": 0,
+                "page": 0,
+                "header": "Título de la imagen",
+                "image_base64": "base64...",
+                "width": 800,
+                "height": 600,
+                "bbox": {"x0": 100, "y0": 200, "x1": 900, "y1": 800},
+                "format": "png"
+            },
+            ...
+        ]
+    }
+    """
+    try:
+        # Detectar si es multipart/form-data (archivo) o JSON
+        pdf_bytes = None
+        
+        # Prioridad 1: Archivo subido directamente
+        if 'pdf_file' in request.files:
+            file = request.files['pdf_file']
+            if file.filename == '':
+                return jsonify({'error': 'No se seleccionó ningún archivo'}), 400
+            
+            logger.info("Recibiendo PDF como archivo: %s", file.filename)
+            pdf_bytes = file.read()
+            
+            if not is_pdf(pdf_bytes):
+                return jsonify({'error': 'El archivo no es un PDF válido'}), 400
+            
+            # Obtener parámetros desde form data
+            data = request.form.to_dict()
+            # Convertir valores numéricos
+            if 'header_distance_threshold' in data:
+                data['header_distance_threshold'] = float(data['header_distance_threshold'])
+            if 'expiry_seconds' in data:
+                data['expiry_seconds'] = int(data['expiry_seconds'])
+            if 'return_url' in data:
+                data['return_url'] = data['return_url'].lower() in ('true', '1', 'yes')
+        
+        # Prioridad 2: JSON con URL o base64
+        else:
+            data = request.json or {}
+            
+            if 'pdf_url' in data:
+                logger.info("Descargando PDF desde URL: %s", data['pdf_url'])
+                import requests
+                response = requests.get(data['pdf_url'], timeout=60)
+                response.raise_for_status()
+                pdf_bytes = response.content
+                
+                if not is_pdf(pdf_bytes):
+                    return jsonify({'error': 'La URL no contiene un PDF válido'}), 400
+                    
+            elif 'pdf_base64' in data:
+                logger.info("Decodificando PDF desde base64")
+                import base64
+                base64_string = data['pdf_base64']
+                if ',' in base64_string:
+                    base64_string = base64_string.split(',')[1]
+                pdf_bytes = base64.b64decode(base64_string)
+                
+                if not is_pdf(pdf_bytes):
+                    return jsonify({'error': 'El base64 no contiene un PDF válido'}), 400
+            else:
+                return jsonify({'error': 'Falta pdf_file, pdf_url o pdf_base64'}), 400
+        
+        # Obtener parámetros opcionales
+        header_distance_threshold = float(data.get('header_distance_threshold', 50.0))
+        return_url = data.get('return_url', True)
+        output_format = data.get('format', 'png').lower()
+        expiry_seconds = data.get('expiry_seconds', 3600)
+        
+        # Validar formato
+        if output_format not in ['png', 'jpg', 'jpeg', 'webp']:
+            return jsonify({'error': f'Formato no soportado: {output_format}. Use: png, jpg, jpeg, webp'}), 400
+        
+        # Extraer imágenes con headers
+        logger.info("Extrayendo imágenes del PDF...")
+        images_with_headers = extract_images_with_headers(pdf_bytes, header_distance_threshold)
+        
+        if not images_with_headers:
+            return jsonify({
+                'success': True,
+                'total_images': 0,
+                'images': [],
+                'message': 'No se encontraron imágenes en el PDF'
+            })
+        
+        logger.info("Se encontraron %d imágenes", len(images_with_headers))
+        
+        # Procesar cada imagen
+        result_images = []
+        base_url = request.host_url.rstrip('/')
+        
+        for idx, img_data in enumerate(images_with_headers):
+            img = img_data['image']
+            
+            # Convertir imagen a formato solicitado
+            if output_format == 'png':
+                extension = 'png'
+                mimetype = 'image/png'
+                _, buffer = cv2.imencode('.png', img)
+            elif output_format in ['jpg', 'jpeg']:
+                extension = 'jpg'
+                mimetype = 'image/jpeg'
+                _, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            elif output_format == 'webp':
+                extension = 'webp'
+                mimetype = 'image/webp'
+                _, buffer = cv2.imencode('.webp', img, [cv2.IMWRITE_WEBP_QUALITY, 95])
+            
+            image_bytes = buffer.tobytes()
+            
+            if return_url:
+                # Guardar archivo temporal y devolver URL
+                file_id, file_path = save_temp_file(image_bytes, extension, expiry_seconds)
+                download_url = f"{base_url}/download/{file_id}"
+                
+                result_images.append({
+                    'index': idx,
+                    'page': img_data['page'],
+                    'header': img_data['header'],
+                    'image_url': download_url,
+                    'file_id': file_id,
+                    'width': img_data['width'],
+                    'height': img_data['height'],
+                    'bbox': img_data['bbox'],
+                    'format': extension,
+                })
+            else:
+                # Devolver base64
+                import base64
+                image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                
+                result_images.append({
+                    'index': idx,
+                    'page': img_data['page'],
+                    'header': img_data['header'],
+                    'image_base64': image_base64,
+                    'width': img_data['width'],
+                    'height': img_data['height'],
+                    'bbox': img_data['bbox'],
+                    'format': extension,
+                })
+        
+        logger.info("Extracción completada: %d imágenes procesadas", len(result_images))
+        
+        return jsonify({
+            'success': True,
+            'total_images': len(result_images),
+            'images': result_images,
+        })
+        
+    except ValueError as exc:
+        logger.warning("Error de validación en extract-pdf-images: %s", exc)
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        logger.error("Error interno en extract-pdf-images: %s", exc, exc_info=True)
         return jsonify({'success': False, 'error': f'Error interno del servidor: {str(exc)}'}), 500

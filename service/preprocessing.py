@@ -944,6 +944,7 @@ def _draw_table_borders(img: np.ndarray) -> np.ndarray:
     """
     Detecta la estructura de una tabla y dibuja bordes explícitos para que Azure Vision la reconozca.
     Usa análisis de proyecciones para detectar filas y columnas, luego dibuja líneas.
+    También detecta si la tabla está rotada y la corrige antes de dibujar bordes.
     
     Args:
         img: Input image
@@ -965,58 +966,90 @@ def _draw_table_borders(img: np.ndarray) -> np.ndarray:
         # Binarize image
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
+        # Try to detect if table region is rotated using Tesseract
+        # Check orientation of text in different regions
+        try:
+            # Sample regions to check orientation
+            regions_to_check = [
+                (0, 0, w//2, h//2),  # Top-left
+                (w//2, 0, w, h//2),  # Top-right
+                (0, h//2, w//2, h),  # Bottom-left
+                (w//2, h//2, w, h),  # Bottom-right
+            ]
+            
+            orientations = []
+            for x1, y1, x2, y2 in regions_to_check:
+                region = gray[y1:y2, x1:x2]
+                if region.size > 0:
+                    try:
+                        osd = pytesseract.image_to_osd(region, config='--psm 0')
+                        for line in osd.split('\n'):
+                            if 'Rotate:' in line:
+                                rot = int(line.split(':')[1].strip())
+                                orientations.append(rot)
+                                break
+                    except:
+                        pass
+            
+            # If most regions indicate 180° rotation, rotate the whole image
+            if len(orientations) > 0:
+                most_common = max(set(orientations), key=orientations.count)
+                if most_common == 180:
+                    logger.info("Tabla detectada rotada 180°, corrigiendo orientación")
+                    result = cv2.rotate(result, cv2.ROTATE_180)
+                    gray = cv2.rotate(gray, cv2.ROTATE_180)
+                    binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        except Exception as e:
+            logger.debug("No se pudo detectar rotación de tabla: %s", e)
+        
         # Horizontal projection: detect rows
         h_projection = np.sum(binary, axis=1)
         h_mean = np.mean(h_projection)
-        h_threshold = h_mean * 0.3  # Lower threshold to catch more rows
+        h_std = np.std(h_projection)
+        h_threshold = h_mean + h_std * 0.3  # Adaptive threshold
         
-        # Find row boundaries (peaks in horizontal projection)
+        # Smooth projection using simple moving average
+        window_size = min(11, len(h_projection) // 20)
+        if window_size > 1:
+            kernel = np.ones(window_size) / window_size
+            smoothed_h = np.convolve(h_projection, kernel, mode='same')
+        else:
+            smoothed_h = h_projection
+        
+        # Find row boundaries using peak detection (local maxima)
         row_boundaries = []
-        in_row = False
-        row_start = 0
-        
-        for i in range(len(h_projection)):
-            if h_projection[i] > h_threshold and not in_row:
-                row_start = i
-                in_row = True
-            elif h_projection[i] <= h_threshold and in_row:
-                row_end = i
-                row_center = (row_start + row_end) // 2
-                row_boundaries.append(row_center)
-                in_row = False
-        
-        if in_row:
-            row_center = (row_start + len(h_projection)) // 2
-            row_boundaries.append(row_center)
+        for i in range(1, len(smoothed_h) - 1):
+            if smoothed_h[i] > h_threshold and smoothed_h[i] > smoothed_h[i-1] and smoothed_h[i] > smoothed_h[i+1]:
+                # Check distance from previous peak
+                if len(row_boundaries) == 0 or i - row_boundaries[-1] > h * 0.015:
+                    row_boundaries.append(i)
         
         # Vertical projection: detect columns
         v_projection = np.sum(binary, axis=0)
         v_mean = np.mean(v_projection)
-        v_threshold = v_mean * 0.3  # Lower threshold to catch more columns
+        v_std = np.std(v_projection)
+        v_threshold = v_mean + v_std * 0.3  # Adaptive threshold
         
-        # Find column boundaries (peaks in vertical projection)
+        # Smooth projection using simple moving average
+        window_size = min(11, len(v_projection) // 20)
+        if window_size > 1:
+            kernel = np.ones(window_size) / window_size
+            smoothed_v = np.convolve(v_projection, kernel, mode='same')
+        else:
+            smoothed_v = v_projection
+        
+        # Find column boundaries using peak detection (local maxima)
         col_boundaries = []
-        in_col = False
-        col_start = 0
-        
-        for i in range(len(v_projection)):
-            if v_projection[i] > v_threshold and not in_col:
-                col_start = i
-                in_col = True
-            elif v_projection[i] <= v_threshold and in_col:
-                col_end = i
-                col_center = (col_start + col_end) // 2
-                col_boundaries.append(col_center)
-                in_col = False
-        
-        if in_col:
-            col_center = (col_start + len(v_projection)) // 2
-            col_boundaries.append(col_center)
+        for i in range(1, len(smoothed_v) - 1):
+            if smoothed_v[i] > v_threshold and smoothed_v[i] > smoothed_v[i-1] and smoothed_v[i] > smoothed_v[i+1]:
+                # Check distance from previous peak
+                if len(col_boundaries) == 0 or i - col_boundaries[-1] > w * 0.015:
+                    col_boundaries.append(i)
         
         # Filter boundaries: keep only significant ones
         # Remove boundaries that are too close together
-        min_row_spacing = h * 0.02  # At least 2% of image height
-        min_col_spacing = w * 0.02  # At least 2% of image width
+        min_row_spacing = h * 0.015  # At least 1.5% of image height
+        min_col_spacing = w * 0.015  # At least 1.5% of image width
         
         filtered_rows = []
         if len(row_boundaries) > 0:
@@ -1034,33 +1067,59 @@ def _draw_table_borders(img: np.ndarray) -> np.ndarray:
         
         # Need at least 2 rows and 2 columns to form a table
         if len(filtered_rows) >= 2 and len(filtered_cols) >= 2:
-            # Draw horizontal lines (row separators)
-            line_thickness = max(2, int(min(h, w) * 0.001))  # Thickness based on image size
+            # Calculate table bounds
+            top_row = min(filtered_rows)
+            bottom_row = max(filtered_rows)
+            left_col = min(filtered_cols)
+            right_col = max(filtered_cols)
+            
+            # Make lines much thicker and more visible for Azure Vision
+            # Base thickness on image size, but make it more prominent
+            base_thickness = max(3, int(min(h, w) * 0.003))  # Increased from 0.001 to 0.003
+            line_thickness = max(4, base_thickness)  # Minimum 4 pixels
+            border_thickness = max(6, base_thickness * 2)  # Outer border even thicker
+            
+            # Use pure black for maximum contrast
             line_color = (0, 0, 0)  # Black lines
             
+            # Draw horizontal lines (row separators) - make them extend slightly beyond columns
+            extend = max(10, int(w * 0.01))  # Extend lines slightly
             for row_y in filtered_rows:
-                cv2.line(result, (0, row_y), (w, row_y), line_color, line_thickness)
+                # Draw thick line
+                cv2.line(result, (max(0, left_col - extend), row_y), (min(w, right_col + extend), row_y), line_color, line_thickness)
+                # Draw a second pass to make it even thicker
+                cv2.line(result, (max(0, left_col - extend), row_y), (min(w, right_col + extend), row_y), line_color, line_thickness)
             
-            # Draw vertical lines (column separators)
+            # Draw vertical lines (column separators) - make them extend slightly beyond rows
             for col_x in filtered_cols:
-                cv2.line(result, (col_x, 0), (col_x, h), line_color, line_thickness)
+                # Draw thick line
+                cv2.line(result, (col_x, max(0, top_row - extend)), (col_x, min(h, bottom_row + extend)), line_color, line_thickness)
+                # Draw a second pass to make it even thicker
+                cv2.line(result, (col_x, max(0, top_row - extend)), (col_x, min(h, bottom_row + extend)), line_color, line_thickness)
             
-            # Draw outer border
-            border_thickness = line_thickness * 2
+            # Draw outer border - make it very prominent
             # Top border
-            top_row = min(filtered_rows)
-            cv2.line(result, (0, top_row), (w, top_row), line_color, border_thickness)
+            cv2.rectangle(result, (left_col, top_row), (right_col, top_row + border_thickness), line_color, -1)
             # Bottom border
-            bottom_row = max(filtered_rows)
-            cv2.line(result, (0, bottom_row), (w, bottom_row), line_color, border_thickness)
+            cv2.rectangle(result, (left_col, bottom_row - border_thickness), (right_col, bottom_row), line_color, -1)
             # Left border
-            left_col = min(filtered_cols)
-            cv2.line(result, (left_col, 0), (left_col, h), line_color, border_thickness)
+            cv2.rectangle(result, (left_col, top_row), (left_col + border_thickness, bottom_row), line_color, -1)
             # Right border
-            right_col = max(filtered_cols)
-            cv2.line(result, (right_col, 0), (right_col, h), line_color, border_thickness)
+            cv2.rectangle(result, (right_col - border_thickness, top_row), (right_col, bottom_row), line_color, -1)
             
-            logger.info("Bordes de tabla dibujados: %d filas, %d columnas", len(filtered_rows), len(filtered_cols))
+            # Also draw corners more prominently
+            corner_size = border_thickness * 2
+            # Top-left corner
+            cv2.rectangle(result, (left_col, top_row), (left_col + corner_size, top_row + corner_size), line_color, -1)
+            # Top-right corner
+            cv2.rectangle(result, (right_col - corner_size, top_row), (right_col, top_row + corner_size), line_color, -1)
+            # Bottom-left corner
+            cv2.rectangle(result, (left_col, bottom_row - corner_size), (left_col + corner_size, bottom_row), line_color, -1)
+            # Bottom-right corner
+            cv2.rectangle(result, (right_col - corner_size, bottom_row - corner_size), (right_col, bottom_row), line_color, -1)
+            
+            logger.info("Bordes de tabla dibujados (gruesos): %d filas, %d columnas, grosor=%d, borde=%d", 
+                       len(filtered_rows), len(filtered_cols), line_thickness, border_thickness)
         else:
             logger.warning("No se detectó estructura de tabla suficiente (filas: %d, columnas: %d)", len(filtered_rows), len(filtered_cols))
     
@@ -1070,21 +1129,101 @@ def _draw_table_borders(img: np.ndarray) -> np.ndarray:
     return result
 
 
-def _upscale_image(img: np.ndarray, target_width: Optional[int] = None, target_height: Optional[int] = None, scale_factor: Optional[float] = None) -> np.ndarray:
+def _is_text_legible_without_upscale(img: np.ndarray) -> bool:
     """
-    Upscale image for better table detection.
+    Detecta si el texto en la imagen ya es lo suficientemente grande y legible
+    sin necesidad de upscale.
+    
+    Args:
+        img: Input image
+    
+    Returns:
+        True si el texto es legible sin upscale, False si necesita upscale
+    """
+    h, w = img.shape[:2]
+    
+    # Si la imagen ya es muy grande, no necesita upscale
+    # Azure DI funciona bien con imágenes entre 1500-5000px
+    if w >= 3000 or h >= 3000:
+        logger.info("Imagen ya es grande (%dx%d), texto probablemente legible sin upscale", w, h)
+        return True
+    
+    # Convertir a escala de grises para análisis
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+    
+    # Analizar densidad de texto y tamaño de caracteres
+    # Usar proyecciones horizontales para detectar líneas de texto
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Proyección horizontal (suma de píxeles por fila)
+    h_projection = np.sum(binary, axis=1)
+    
+    # Encontrar picos (líneas de texto)
+    h_mean = np.mean(h_projection)
+    h_threshold = h_mean * 1.5
+    peaks = np.where(h_projection > h_threshold)[0]
+    
+    if len(peaks) == 0:
+        # No hay texto detectado, no necesita upscale
+        return True
+    
+    # Calcular altura promedio de líneas de texto
+    # Agrupar picos cercanos (misma línea)
+    line_heights = []
+    if len(peaks) > 0:
+        current_line_start = peaks[0]
+        for i in range(1, len(peaks)):
+            if peaks[i] - peaks[i-1] > 5:  # Nueva línea
+                line_height = peaks[i-1] - current_line_start
+                if line_height > 0:
+                    line_heights.append(line_height)
+                current_line_start = peaks[i]
+        # Última línea
+        if len(peaks) > 1:
+            line_height = peaks[-1] - current_line_start
+            if line_height > 0:
+                line_heights.append(line_height)
+    
+    if len(line_heights) > 0:
+        avg_line_height = np.mean(line_heights)
+        # Si la altura promedio de las líneas es >= 15px, el texto es legible
+        # (texto pequeño típicamente tiene 8-12px de altura)
+        if avg_line_height >= 15:
+            logger.info("Texto detectado con altura promedio %.1fpx, legible sin upscale", avg_line_height)
+            return True
+    
+    # Si la imagen tiene buen tamaño y densidad de texto razonable
+    # Considerar legible si tiene al menos 2000px de ancho
+    if w >= 2000 and h >= 1500:
+        text_density = np.sum(binary > 0) / (w * h)
+        if text_density > 0.1:  # Al menos 10% de la imagen es texto
+            logger.info("Imagen con buen tamaño (%dx%d) y densidad de texto (%.2f%%)", w, h, text_density * 100)
+            return True
+    
+    return False
+
+
+def _upscale_image(img: np.ndarray, target_width: Optional[int] = None, target_height: Optional[int] = None, scale_factor: Optional[float] = None, max_dimension: int = 5000) -> np.ndarray:
+    """
+    Upscale image for better table detection, con límites máximos para evitar exceder
+    los límites de Azure Document Intelligence.
     
     Args:
         img: Input image
         target_width: Target width in pixels
         target_height: Target height in pixels
         scale_factor: Scale factor (e.g., 2.0 for 2x)
+        max_dimension: Dimensión máxima permitida (default: 5000px para Azure DI)
     
     Returns:
-        Upscaled image
+        Upscaled image (limitada a max_dimension)
     """
     h, w = img.shape[:2]
     
+    # Calcular dimensiones objetivo
     if scale_factor is not None:
         new_w = int(w * scale_factor)
         new_h = int(h * scale_factor)
@@ -1100,6 +1239,30 @@ def _upscale_image(img: np.ndarray, target_width: Optional[int] = None, target_h
         new_w = int(w * scale)
         new_h = target_height
     else:
+        return img
+    
+    # Aplicar límite máximo para evitar exceder límites de Azure DI
+    # Azure DI tiene límites alrededor de 5000-7000px, usar 5000px como seguro
+    max_w = max_dimension
+    max_h = max_dimension
+    
+    # Si alguna dimensión excede el máximo, escalar proporcionalmente
+    if new_w > max_w or new_h > max_h:
+        scale_w = max_w / new_w if new_w > max_w else 1.0
+        scale_h = max_h / new_h if new_h > max_h else 1.0
+        scale = min(scale_w, scale_h)  # Usar el más restrictivo
+        
+        new_w = int(new_w * scale)
+        new_h = int(new_h * scale)
+        
+        logger.warning(
+            "Upscale limitado a %dx%d (máximo permitido: %dpx) para evitar exceder límites de Azure DI",
+            new_w, new_h, max_dimension
+        )
+    
+    # Si las dimensiones finales son menores o iguales a las originales, no hacer upscale
+    if new_w <= w and new_h <= h:
+        logger.info("Upscale no necesario: dimensiones objetivo (%dx%d) <= originales (%dx%d)", new_w, new_h, w, h)
         return img
     
     # Use INTER_CUBIC for better quality when upscaling
@@ -1200,19 +1363,42 @@ def preprocess_for_table_ocr(img: np.ndarray, options: Optional[Dict] = None) ->
     # Apply upscaling if requested
     upscale_enabled = options.get("upscale", False)
     if upscale_enabled:
-        upscale_width = options.get("upscale_width")
-        upscale_height = options.get("upscale_height")
-        upscale_factor = options.get("upscale_factor")
+        # Verificar si el texto ya es legible sin upscale
+        # Si la imagen ya tiene buen tamaño y texto legible, evitar upscale innecesario
+        skip_upscale_if_legible = options.get("skip_upscale_if_legible", True)
         
-        original_h, original_w = processed.shape[:2]
-        processed = _upscale_image(processed, target_width=upscale_width, target_height=upscale_height, scale_factor=upscale_factor)
-        new_h, new_w = processed.shape[:2]
-        
-        scale_info = f"upscale_{new_w}x{new_h}"
-        if upscale_factor:
-            scale_info = f"upscale_{upscale_factor:.1f}x"
-        metadata["applied_operations"].append(scale_info)
-        logger.info("Aplicado upscaling: %dx%d -> %dx%d", original_w, original_h, new_w, new_h)
+        if skip_upscale_if_legible and _is_text_legible_without_upscale(processed):
+            logger.info("Upscale omitido: texto ya es legible sin upscale")
+            metadata["applied_operations"].append("upscale_skipped_text_legible")
+        else:
+            upscale_width = options.get("upscale_width")
+            upscale_height = options.get("upscale_height")
+            upscale_factor = options.get("upscale_factor")
+            max_dimension = options.get("max_dimension", 5000)  # Límite máximo para Azure DI
+            
+            original_h, original_w = processed.shape[:2]
+            processed = _upscale_image(
+                processed, 
+                target_width=upscale_width, 
+                target_height=upscale_height, 
+                scale_factor=upscale_factor,
+                max_dimension=max_dimension
+            )
+            new_h, new_w = processed.shape[:2]
+            
+            # Validar dimensiones finales antes de continuar
+            if new_w > 7000 or new_h > 7000:
+                logger.error(
+                    "ADVERTENCIA: Dimensiones finales (%dx%d) exceden límites seguros de Azure DI. "
+                    "Considera reducir upscale o usar crop de tabla.",
+                    new_w, new_h
+                )
+            
+            scale_info = f"upscale_{new_w}x{new_h}"
+            if upscale_factor:
+                scale_info = f"upscale_{upscale_factor:.1f}x"
+            metadata["applied_operations"].append(scale_info)
+            logger.info("Aplicado upscaling: %dx%d -> %dx%d", original_w, original_h, new_w, new_h)
     
     return processed, metadata
 
