@@ -1,19 +1,19 @@
 import logging
+import os
 from io import BytesIO
 
 import cv2
+import numpy as np
 from flask import Blueprint, jsonify, request, send_file
+from PIL import Image
 
-from .analysis import analyze_image
 from .image_io import (
     decode_base64_image,
-    decode_base64_pdf,
     download_image_from_url,
-    download_pdf_from_url,
     encode_image_to_base64,
 )
-from .pdf_extract import extract_pdf_fe
 from .preprocessing import preprocess_for_table_ocr
+from .temp_files import cleanup_expired_files, get_temp_file, save_temp_file
 
 logger = logging.getLogger(__name__)
 
@@ -25,52 +25,74 @@ def health():
     return jsonify({'status': 'ok'})
 
 
+@api.route('/download/<file_id>', methods=['GET'])
+def download_temp_file(file_id: str):
+    """
+    GET /download/<file_id>
+    
+    Descarga un archivo temporal procesado.
+    Los archivos expiran automáticamente después de un tiempo configurado.
+    """
+    try:
+        logger.info("Solicitud de descarga recibida para file_id: %s", file_id)
+        
+        # Limpiar archivos expirados periódicamente
+        cleanup_expired_files()
+        
+        # Obtener archivo temporal
+        file_path = get_temp_file(file_id)
+        
+        if file_path is None:
+            logger.warning("Archivo temporal no encontrado o expirado: %s", file_id)
+            return jsonify({'error': 'Archivo no encontrado o expirado'}), 404
+        
+        if not file_path.exists():
+            logger.error("Ruta de archivo no existe: %s (absoluta: %s)", file_path, file_path.absolute())
+            return jsonify({'error': f'Archivo no encontrado: {file_path}'}), 404
+        
+        logger.info("Archivo encontrado: %s (absoluta: %s)", file_path, file_path.absolute())
+        
+        # Determinar mimetype según extensión
+        extension = file_path.suffix.lower()
+        mimetypes = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.webp': 'image/webp',
+            '.pdf': 'application/pdf',
+        }
+        mimetype = mimetypes.get(extension, 'application/octet-stream')
+        
+        # Enviar archivo
+        return send_file(
+            str(file_path),
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=file_path.name
+        )
+    
+    except Exception as exc:
+        logger.error("Error al descargar archivo temporal %s: %s", file_id, exc, exc_info=True)
+        return jsonify({'error': f'Error al descargar archivo: {str(exc)}'}), 500
+
+
 @api.route('/preprocess', methods=['POST'])
 def preprocess():
     """
     POST /preprocess
+    Aplica rotación automática para dejar la tabla derecha.
+    
     Body: {
         "image_url": "https://...",     # o
         "image_base64": "base64...",
-        "preset": "table_ocr",          # Presets disponibles:
-                                        #   - table_ocr (default)
-                                        #   - table_ocr_aggressive
-                                        #   - white_text_on_color
-                                        #   - red_table_blurry (para fondo rojo + texto blanco borroso)
-                                        #   - smart_auto (análisis inteligente automático)
-                                        #   - small_text_sharp (para detección de estructura)
-                                        #   - ocr_preserve_details (preserva detalles finos)
-                                        #   - ocr_ultra_fine (CLAHE+bilateral+adaptive+morfología)
-                                        #   - gemini_vision (NUEVO⭐: para Gemini/GPT-Vision/Claude)
-                                        #   - gemini_vision_rotated (igual pero rota 180° primero)
-                                        #   - minimal
+        "preset": "default",            # Presets disponibles:
+                                        #   - default (rotación automática con deskew)
+                                        #   - rotation_only (solo rotación, sin deskew)
         
-        # Opciones directas (sin anidación):
-        "smart_table_analysis": true,
-        "auto_crop_table": true,  # NUEVO: Zoom automático a la región de la tabla detectada
-        "auto_crop_threshold": 0.95,  # Threshold para crop (0.85 = solo si región < 85%, más conservador)
-        "force_strategy": "red_background_advanced",  # Estrategias: white_on_black, black_on_white,
-                                                      # enhance_contrast, extract_luminosity, 
-                                                      # red_background_advanced (NUEVO), invert_colors
-        "deblur": true,
-        "deblur_method": "unsharp",
-        "upscale": true,
-        "min_size": 1000,
-        "max_scale": 3.0,
-        "rotate_180": false,
-        "enhance_contrast": true,
-        "clip_limit": 3.0,
-        "remove_color_bg": true,
-        "extract_white_text": false,
-        "extract_text_adaptive": false,
-        "deskew": true,
-        "denoise": true,
-        "denoise_method": "bilateral",
-        "sharpen": false,
-        "sharpen_strength": 1.0,
-        "binarize": false,
-        "binarize_method": "otsu",
-        "auto_invert": true
+        # Opciones de rotación automática:
+        "enable_deskew": true,          # Aplicar corrección de inclinación pequeña (default: true)
+        "deskew_max_abs_deg": 8.0,      # Máximo ángulo de deskew en grados (default: 8.0)
+        "min_improvement": 0.0         # Mejora mínima requerida para aplicar rotación (default: 0.0 - máximo agresivo)
     }
     """
     try:
@@ -86,222 +108,40 @@ def preprocess():
         if img is None:
             return jsonify({'error': 'No se pudo decodificar imagen'}), 400
 
-        preset = data.get('preset', 'table_ocr')
-        
-        # Claves especiales que no son opciones de procesamiento
-        special_keys = {'image_url', 'image_base64', 'pdf_url', 'pdf_base64', 'preset'}
-        
-        # Extraer todas las opciones directamente del nivel raíz (excluyendo claves especiales)
-        options = {k: v for k, v in data.items() if k not in special_keys}
+        preset = data.get('preset', 'default')
 
-        if not options:
-            if preset == 'table_ocr':
-                options = {
-                    'upscale': True,
-                    'enhance_contrast': True,
-                    'convert_to_grayscale': True,
-                    'remove_color_bg': False,
-                    'deskew': True,
-                    'denoise': True,
-                    'sharpen': False,
-                    'binarize': False,
-                    'auto_invert': True,
-                    'clip_limit': 3.0,
-                }
-            elif preset == 'table_ocr_aggressive':
-                options = {
-                    'upscale': True,
-                    'enhance_contrast': True,
-                    'remove_color_bg': True,
-                    'deskew': True,
-                    'denoise': True,
-                    'denoise_method': 'nlm',
-                    'sharpen': True,
-                    'sharpen_strength': 1.5,
-                    'binarize': True,
-                    'binarize_method': 'adaptive_gaussian',
-                    'auto_invert': True,
-                    'clip_limit': 4.0,
-                }
-            elif preset == 'white_text_on_color':
-                options = {
-                    'rotate_180': False,
-                    'upscale': True,
-                    'min_size': 1200,
-                    'max_scale': 4.0,
-                    'enhance_contrast': True,
-                    'clip_limit': 5.0,
-                    'extract_white_text': True,
-                    'remove_color_bg': False,
-                    'deskew': True,
-                    'denoise': True,
-                    'sharpen': False,
-                    'binarize': False,
-                    'auto_invert': False,
-                }
-            elif preset == 'red_table_blurry':
-                # NUEVO: Preset óptimo para tablas con fondo rojo y texto blanco borroso
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'force_strategy': 'red_background_advanced',
-                    'upscale': True,
-                    'min_size': 1000,
-                    'max_scale': 3.0,
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                }
-            elif preset == 'smart_auto':
-                # Análisis inteligente automático (sin forzar estrategia)
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'upscale': True,
-                    'min_size': 1000,
-                    'max_scale': 3.0,
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                }
-            elif preset == 'small_text_sharp':
-                # Para DETECCIÓN DE ESTRUCTURA de tabla (bordes, líneas)
-                # ADVERTENCIA: Puede engrosar trazos y perder detalles finos para OCR
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'upscale': True,
-                    'min_size': 2000,
-                    'max_scale': 5.0,
-                    'upscale_method': 'lanczos4',
-                    'deblur': True,
-                    'deblur_method': 'aggressive',
-                    'deblur_strength': 1.0,
-                    'sharpen': True,
-                    'sharpen_strength': 0.5,
-                    'sharpen_method': 'unsharp',
-                    'preserve_fine_details': True,
-                }
-            elif preset == 'ocr_preserve_details':
-                # NUEVO: Para OCR de texto/números - PRESERVA detalles finos
-                # Optimizado para mantener comas, puntos, símbolos (<, %, *, etc.)
-                # Menos procesamiento = menos distorsión
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'upscale': True,
-                    'min_size': 1800,
-                    'max_scale': 4.0,
-                    'upscale_method': 'lanczos4',
-                    'deblur': True,
-                    'deblur_method': 'unsharp',  # Menos agresivo que aggressive
-                    'deblur_strength': 0.6,  # Muy suave
-                    'sharpen': False,  # Sin sharpening extra para no engrosar
-                    'preserve_fine_details': True,
-                }
-            elif preset == 'ocr_ultra_fine':
-                # NUEVO: Ultra-optimizado para OCR con parámetros granulares
-                # Basado en feedback: CLAHE + bilateral + adaptive threshold + morfología
-                # Ideal para tablas nutricionales con texto muy pequeño
-                options = {
-                    'smart_table_analysis': False,  # Control manual total
-                    'upscale': True,
-                    'min_size': 2400,
-                    'max_scale': 3.0,
-                    'upscale_method': 'lanczos4',
-                    'denoise': True,
-                    'denoise_method': 'bilateral',
-                    'bilateral_d': 5,
-                    'bilateral_sigma_color': 50,
-                    'bilateral_sigma_space': 50,
-                    'enhance_contrast': True,
-                    'clip_limit': 1.8,
-                    'clahe_tile_grid_size': [8, 8],
-                    'remove_color_bg': True,
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                    'deblur_strength': 0.35,
-                    'sharpen': False,
-                    'binarize': True,
-                    'binarize_method': 'adaptive_gaussian',
-                    'adaptive_block_size': 51,
-                    'adaptive_C': 9,
-                    'post_morphology': True,
-                    'morphology_mode': 'open',
-                    'morphology_kernel': [2, 2],
-                    'morphology_iterations': 1,
-                    'preserve_fine_details': True,
-                    'deskew': False,
-                    'auto_invert': False,
-                }
-            elif preset == 'gemini_vision':
-                # SIMPLE: Solo escala de grises + contraste + zoom leve + rotación/inversión automática
-                # Optimizado para Gemini 2.5 Pro (mantiene imagen natural)
-                options = {
-                    'smart_table_analysis': False,  # Sin análisis automático de estrategias
-                    'auto_crop_table': True,  # Zoom leve y conservador
-                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
-                    'rotate_180': False,  # Cambiar a true si la imagen está al revés
-                    'upscale': True,
-                    'min_size': 2000,  # Más grande para mantener calidad después del zoom
-                    'max_scale': 3.5,
-                    'upscale_method': 'lanczos4',
-                    # Convertir a escala de grises (rojo → gris)
-                    'convert_to_grayscale': True,
-                    # CLAHE para buen contraste
-                    'enhance_contrast': True,
-                    'clip_limit': 3.0,  # Un poco más de contraste
-                    'clahe_tile_grid_size': [8, 8],
-                    # Deblur MUY suave para texto pequeño
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                    'deblur_strength': 0.4,
-                    # TODO LO DEMÁS DESACTIVADO (imagen natural)
-                    'denoise': False,
-                    'remove_color_bg': False,
-                    'sharpen': False,
-                    'binarize': False,  # SIN BINARIZAR
-                    'post_morphology': False,
-                    'deskew': False,
-                    'auto_invert': True,  # ACTIVADO: invierte automáticamente si fondo es oscuro
-                    'extract_white_text': False,
-                    'extract_text_adaptive': False,
-                }
-            elif preset == 'gemini_vision_rotated':
-                # Igual a gemini_vision pero ROTA 180° primero (para imágenes al revés)
-                options = {
-                    'smart_table_analysis': False,
-                    'auto_crop_table': True,  # Zoom leve y conservador
-                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
-                    'rotate_180': True,  # ROTACIÓN 180°
-                    'upscale': True,
-                    'min_size': 2000,  # Más grande para mantener calidad
-                    'max_scale': 3.5,
-                    'upscale_method': 'lanczos4',
-                    'convert_to_grayscale': True,
-                    'enhance_contrast': True,
-                    'clip_limit': 3.0,
-                    'clahe_tile_grid_size': [8, 8],
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                    'deblur_strength': 0.4,
-                    'denoise': False,
-                    'remove_color_bg': False,
-                    'sharpen': False,
-                    'binarize': False,
-                    'post_morphology': False,
-                    'deskew': False,
-                    'auto_invert': True,
-                    'extract_white_text': False,
-                    'extract_text_adaptive': False,
-                }
-            elif preset == 'minimal':
-                options = {
-                    'upscale': False,
-                    'enhance_contrast': True,
-                    'remove_color_bg': False,
-                    'deskew': False,
-                    'denoise': False,
-                    'auto_invert': True,
-                }
+        # Claves especiales que no son opciones de procesamiento
+        special_keys = {'image_url', 'image_base64', 'preset'}
+
+        # Extraer opciones personalizadas del usuario (excluyendo claves especiales)
+        user_options = {k: v for k, v in data.items() if k not in special_keys}
+
+        # Cargar preset primero
+        options = {}
+        if preset == 'default':
+            # Rotación automática con deskew habilitado
+            options = {
+                'enable_deskew': True,
+                'deskew_max_abs_deg': 8.0,
+                'min_improvement': 0.0,
+            }
+        elif preset == 'rotation_only':
+            # Solo rotación automática, sin deskew
+            options = {
+                'enable_deskew': False,
+                'deskew_max_abs_deg': 8.0,
+                'min_improvement': 0.0,
+            }
+        else:
+            # Si el preset no existe, usar valores por defecto
+            options = {
+                'enable_deskew': True,
+                'deskew_max_abs_deg': 8.0,
+                'min_improvement': 0.0,
+            }
+
+        # Sobrescribir opciones del preset con las opciones personalizadas del usuario
+        options.update(user_options)
 
         processed, metadata = preprocess_for_table_ocr(img, options)
         result_b64 = encode_image_to_base64(processed)
@@ -324,58 +164,46 @@ def preprocess():
         return jsonify({'success': False, 'error': f'Error interno del servidor: {str(exc)}'}), 500
 
 
-@api.route('/analyze', methods=['POST'])
-def analyze():
-    """Analiza imagen y sugiere operaciones."""
-    try:
-        data = request.json or {}
-
-        if 'image_url' in data:
-            img = download_image_from_url(data['image_url'])
-        elif 'image_base64' in data:
-            img = decode_base64_image(data['image_base64'])
-        else:
-            return jsonify({'error': 'Falta imagen'}), 400
-
-        result = analyze_image(img)
-        return jsonify(result)
-
-    except ValueError as exc:
-        logger.warning("Error de validación en analyze: %s", exc)
-        return jsonify({'success': False, 'error': str(exc)}), 400
-    except Exception as exc:
-        logger.error("Error interno en analyze: %s", exc, exc_info=True)
-        return jsonify({'success': False, 'error': f'Error interno del servidor: {str(exc)}'}), 500
-
-
 @api.route('/preprocess-image', methods=['POST'])
 def preprocess_image():
     """
     POST /preprocess-image
     
-    Devuelve la imagen procesada directamente como archivo (no JSON).
+    Procesa la imagen y devuelve una URL temporal para descargarla.
+    Aplica rotación automática para dejar la tabla derecha.
     
     Body: {
         "image_url": "https://...",     # o
         "image_base64": "base64...",
-        "preset": "table_ocr",          # Presets: table_ocr, table_ocr_aggressive, white_text_on_color,
-                                        # red_table_blurry, smart_auto, minimal
+        "preset": "default",            # Presets: default, rotation_only
         "format": "png",                # Formato de salida: "png" (default), "jpg", "jpeg", "webp"
+        "dpi": 300,                     # DPI de la imagen de salida (default: 300)
+        "return_url": true,             # Si true, devuelve URL temporal; si false, devuelve archivo directo (default: true)
+        "expiry_seconds": 3600,        # Tiempo de expiración de la URL en segundos (default: 3600 = 1 hora)
         
-        # Todas las opciones de preprocesamiento (ver /preprocess)
-        "force_strategy": "white_on_black",
-        "upscale": true,
-        "deblur": true,
-        # ... etc
+        # Opciones de rotación automática:
+        "enable_deskew": true,          # Aplicar corrección de inclinación pequeña (default: true)
+        "deskew_max_abs_deg": 8.0,      # Máximo ángulo de deskew en grados (default: 8.0)
+        "min_improvement": 0.0         # Mejora mínima requerida para aplicar rotación (default: 0.0 - máximo agresivo)
     }
     
-    Respuesta: archivo de imagen (image/png, image/jpeg, etc.)
-    Headers opcionales en la respuesta:
-        - X-Original-Width: ancho original
-        - X-Original-Height: alto original
-        - X-Processed-Width: ancho procesado
-        - X-Processed-Height: alto procesado
-        - X-Applied-Operations: operaciones aplicadas
+    Respuesta (si return_url=true):
+    {
+        "success": true,
+        "download_url": "http://localhost:5050/download/<file_id>",
+        "file_id": "<file_id>",
+        "expires_in_seconds": 3600,
+        "metadata": {
+            "original_size": {"w": 1000, "h": 800},
+            "processed_size": {"w": 1000, "h": 800},
+            "dpi": 300,
+            "format": "png",
+            "applied_operations": ["rotate_0"]
+        }
+    }
+    
+    Respuesta (si return_url=false):
+    - Archivo de imagen directamente (comportamiento anterior)
     """
     try:
         data = request.json or {}
@@ -390,254 +218,131 @@ def preprocess_image():
         if img is None:
             return jsonify({'error': 'No se pudo decodificar imagen'}), 400
 
-        preset = data.get('preset', 'table_ocr')
+        preset = data.get('preset', 'default')
         output_format = data.get('format', 'png').lower()
-        
+
         # Validar formato
         if output_format not in ['png', 'jpg', 'jpeg', 'webp']:
             return jsonify({'error': f'Formato no soportado: {output_format}. Use: png, jpg, jpeg, webp'}), 400
-        
-        # Claves especiales que no son opciones de procesamiento
-        special_keys = {'image_url', 'image_base64', 'pdf_url', 'pdf_base64', 'preset', 'format'}
-        
-        # Extraer todas las opciones directamente del nivel raíz
-        options = {k: v for k, v in data.items() if k not in special_keys}
 
-        if not options:
-            if preset == 'table_ocr':
-                options = {
-                    'upscale': True,
-                    'enhance_contrast': True,
-                    'convert_to_grayscale': True,
-                    'remove_color_bg': False,
-                    'deskew': True,
-                    'denoise': True,
-                    'sharpen': False,
-                    'binarize': False,
-                    'auto_invert': True,
-                    'clip_limit': 3.0,
-                }
-            elif preset == 'table_ocr_aggressive':
-                options = {
-                    'upscale': True,
-                    'enhance_contrast': True,
-                    'remove_color_bg': True,
-                    'deskew': True,
-                    'denoise': True,
-                    'denoise_method': 'nlm',
-                    'sharpen': True,
-                    'sharpen_strength': 1.5,
-                    'binarize': True,
-                    'binarize_method': 'adaptive_gaussian',
-                    'auto_invert': True,
-                    'clip_limit': 4.0,
-                }
-            elif preset == 'white_text_on_color':
-                options = {
-                    'rotate_180': False,
-                    'upscale': True,
-                    'min_size': 1200,
-                    'max_scale': 4.0,
-                    'enhance_contrast': True,
-                    'clip_limit': 5.0,
-                    'extract_white_text': True,
-                    'remove_color_bg': False,
-                    'deskew': True,
-                    'denoise': True,
-                    'sharpen': False,
-                    'binarize': False,
-                    'auto_invert': False,
-                }
-            elif preset == 'red_table_blurry':
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'force_strategy': 'red_background_advanced',
-                    'upscale': True,
-                    'min_size': 1000,
-                    'max_scale': 3.0,
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                }
-            elif preset == 'smart_auto':
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'upscale': True,
-                    'min_size': 1000,
-                    'max_scale': 3.0,
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                }
-            elif preset == 'small_text_sharp':
-                # Para DETECCIÓN DE ESTRUCTURA de tabla (bordes, líneas)
-                # ADVERTENCIA: Puede engrosar trazos y perder detalles finos para OCR
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'upscale': True,
-                    'min_size': 2000,
-                    'max_scale': 5.0,
-                    'upscale_method': 'lanczos4',
-                    'deblur': True,
-                    'deblur_method': 'aggressive',
-                    'deblur_strength': 1.0,
-                    'sharpen': True,
-                    'sharpen_strength': 0.5,
-                    'sharpen_method': 'unsharp',
-                    'preserve_fine_details': True,
-                }
-            elif preset == 'ocr_preserve_details':
-                # NUEVO: Para OCR de texto/números - PRESERVA detalles finos
-                # Optimizado para mantener comas, puntos, símbolos (<, %, *, etc.)
-                # Menos procesamiento = menos distorsión
-                options = {
-                    'smart_table_analysis': True,
-                    'auto_crop_table': True,
-                    'upscale': True,
-                    'min_size': 1800,
-                    'max_scale': 4.0,
-                    'upscale_method': 'lanczos4',
-                    'deblur': True,
-                    'deblur_method': 'unsharp',  # Menos agresivo que aggressive
-                    'deblur_strength': 0.6,  # Muy suave
-                    'sharpen': False,  # Sin sharpening extra para no engrosar
-                    'preserve_fine_details': True,
-                }
-            elif preset == 'ocr_ultra_fine':
-                # NUEVO: Ultra-optimizado con parámetros granulares
-                options = {
-                    'smart_table_analysis': False,
-                    'upscale': True,
-                    'min_size': 2400,
-                    'max_scale': 3.0,
-                    'upscale_method': 'lanczos4',
-                    'denoise': True,
-                    'denoise_method': 'bilateral',
-                    'bilateral_d': 5,
-                    'bilateral_sigma_color': 50,
-                    'bilateral_sigma_space': 50,
-                    'enhance_contrast': True,
-                    'clip_limit': 1.8,
-                    'clahe_tile_grid_size': [8, 8],
-                    'remove_color_bg': True,
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                    'deblur_strength': 0.35,
-                    'sharpen': False,
-                    'binarize': True,
-                    'binarize_method': 'adaptive_gaussian',
-                    'adaptive_block_size': 51,
-                    'adaptive_C': 9,
-                    'post_morphology': True,
-                    'morphology_mode': 'open',
-                    'morphology_kernel': [2, 2],
-                    'morphology_iterations': 1,
-                    'preserve_fine_details': True,
-                    'deskew': False,
-                    'auto_invert': False,
-                }
-            elif preset == 'gemini_vision':
-                # SIMPLE: Solo escala de grises + contraste + zoom leve + rotación/inversión automática
-                # Optimizado para Gemini 2.5 Pro (mantiene imagen natural)
-                options = {
-                    'smart_table_analysis': False,  # Sin análisis automático de estrategias
-                    'auto_crop_table': True,  # Zoom leve y conservador
-                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
-                    'rotate_180': False,  # Cambiar a true si la imagen está al revés
-                    'upscale': True,
-                    'min_size': 2000,  # Más grande para mantener calidad después del zoom
-                    'max_scale': 3.5,
-                    'upscale_method': 'lanczos4',
-                    # Convertir a escala de grises (rojo → gris)
-                    'convert_to_grayscale': True,
-                    # CLAHE para buen contraste
-                    'enhance_contrast': True,
-                    'clip_limit': 3.0,  # Un poco más de contraste
-                    'clahe_tile_grid_size': [8, 8],
-                    # Deblur MUY suave para texto pequeño
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                    'deblur_strength': 0.4,
-                    # TODO LO DEMÁS DESACTIVADO (imagen natural)
-                    'denoise': False,
-                    'remove_color_bg': False,
-                    'sharpen': False,
-                    'binarize': False,  # SIN BINARIZAR
-                    'post_morphology': False,
-                    'deskew': False,
-                    'auto_invert': True,  # ACTIVADO: invierte automáticamente si fondo es oscuro
-                    'extract_white_text': False,
-                    'extract_text_adaptive': False,
-                }
-            elif preset == 'gemini_vision_rotated':
-                # Igual a gemini_vision pero ROTA 180° primero (para imágenes al revés)
-                options = {
-                    'smart_table_analysis': False,
-                    'auto_crop_table': True,  # Zoom leve y conservador
-                    'auto_crop_threshold': 0.70,  # MUY conservador (solo si región < 70%)
-                    'rotate_180': True,  # ROTACIÓN 180°
-                    'upscale': True,
-                    'min_size': 2000,  # Más grande para mantener calidad
-                    'max_scale': 3.5,
-                    'upscale_method': 'lanczos4',
-                    'convert_to_grayscale': True,
-                    'enhance_contrast': True,
-                    'clip_limit': 3.0,
-                    'clahe_tile_grid_size': [8, 8],
-                    'deblur': True,
-                    'deblur_method': 'unsharp',
-                    'deblur_strength': 0.4,
-                    'denoise': False,
-                    'remove_color_bg': False,
-                    'sharpen': False,
-                    'binarize': False,
-                    'post_morphology': False,
-                    'deskew': False,
-                    'auto_invert': True,
-                    'extract_white_text': False,
-                    'extract_text_adaptive': False,
-                }
-            elif preset == 'minimal':
-                options = {
-                    'upscale': False,
-                    'enhance_contrast': True,
-                    'remove_color_bg': False,
-                    'deskew': False,
-                    'denoise': False,
-                    'auto_invert': True,
-                }
+        # Claves especiales que no son opciones de procesamiento
+        special_keys = {'image_url', 'image_base64', 'preset', 'format'}
+
+        # Extraer opciones personalizadas del usuario
+        user_options = {k: v for k, v in data.items() if k not in special_keys}
+
+        # Cargar preset primero
+        options = {}
+        if preset == 'default':
+            # Rotación automática con deskew habilitado
+            options = {
+                'enable_deskew': True,
+                'deskew_max_abs_deg': 8.0,
+                'min_improvement': 0.0,
+            }
+        elif preset == 'rotation_only':
+            # Solo rotación automática, sin deskew
+            options = {
+                'enable_deskew': False,
+                'deskew_max_abs_deg': 8.0,
+                'min_improvement': 0.0,
+            }
+        else:
+            # Si el preset no existe, usar valores por defecto
+            options = {
+                'enable_deskew': True,
+                'deskew_max_abs_deg': 8.0,
+                'min_improvement': 0.0,
+            }
+
+        # Sobrescribir opciones del preset con las opciones personalizadas del usuario
+        options.update(user_options)
 
         # Procesar imagen
         processed, metadata = preprocess_for_table_ocr(img, options)
         
-        # Convertir a bytes según el formato solicitado
+        # Obtener DPI del request (por defecto 300 DPI)
+        dpi = int(data.get('dpi', 300))
+        
+        # Verificar si se debe devolver URL o archivo directo
+        return_url = data.get('return_url', True)
+        
+        # Convertir imagen de OpenCV (BGR) a PIL (RGB)
+        if len(processed.shape) == 2:
+            # Escala de grises
+            pil_img = Image.fromarray(processed, mode='L')
+        elif len(processed.shape) == 3:
+            # Color BGR -> RGB
+            processed_rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(processed_rgb, mode='RGB')
+        else:
+            return jsonify({'error': 'Formato de imagen no soportado'}), 500
+        
+        # Establecer DPI en la imagen
+        pil_img.info['dpi'] = (dpi, dpi)
+        
+        # Guardar imagen en BytesIO con DPI
+        img_io = BytesIO()
+        
         if output_format == 'png':
-            success, buffer = cv2.imencode('.png', processed)
+            pil_img.save(img_io, format='PNG', dpi=(dpi, dpi))
             mimetype = 'image/png'
             extension = 'png'
         elif output_format in ['jpg', 'jpeg']:
-            # Si la imagen es en escala de grises, convertir a BGR para JPEG
-            if len(processed.shape) == 2:
-                processed_bgr = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-            else:
-                processed_bgr = processed
-            success, buffer = cv2.imencode('.jpg', processed_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            # Convertir a RGB si es escala de grises para JPEG
+            if pil_img.mode == 'L':
+                pil_img = pil_img.convert('RGB')
+            pil_img.save(img_io, format='JPEG', dpi=(dpi, dpi), quality=95)
             mimetype = 'image/jpeg'
             extension = 'jpg'
         elif output_format == 'webp':
-            success, buffer = cv2.imencode('.webp', processed, [cv2.IMWRITE_WEBP_QUALITY, 95])
+            pil_img.save(img_io, format='WEBP', dpi=(dpi, dpi), quality=95)
             mimetype = 'image/webp'
             extension = 'webp'
         
-        if not success:
-            return jsonify({'error': 'Error al codificar imagen'}), 500
-        
-        # Crear BytesIO buffer
-        img_io = BytesIO(buffer.tobytes())
         img_io.seek(0)
+        file_data = img_io.getvalue()
         
-        # Preparar headers con metadata
+        # Si return_url es True, guardar archivo temporal y devolver URL
+        if return_url:
+            # Obtener tiempo de expiración
+            expiry_seconds = data.get('expiry_seconds')
+            if expiry_seconds is not None:
+                expiry_seconds = int(expiry_seconds)
+            
+            # Guardar archivo temporal
+            file_id, file_path = save_temp_file(file_data, extension, expiry_seconds)
+            
+            # Construir URL de descarga
+            # Usar request.host_url para obtener la URL base del servidor
+            base_url = request.host_url.rstrip('/')
+            download_url = f"{base_url}/download/{file_id}"
+            
+            logger.info(
+                "Imagen procesada y guardada temporalmente - Original: %dx%d, Procesado: %dx%d, Formato: %s, DPI: %d, File ID: %s",
+                img.shape[1], img.shape[0],
+                processed.shape[1], processed.shape[0],
+                output_format, dpi, file_id
+            )
+            
+            # Devolver JSON con URL temporal
+            return jsonify({
+                'success': True,
+                'download_url': download_url,
+                'file_id': file_id,
+                'expires_in_seconds': expiry_seconds if expiry_seconds is not None else 3600,
+                'metadata': {
+                    'original_size': {'w': img.shape[1], 'h': img.shape[0]},
+                    'processed_size': {'w': processed.shape[1], 'h': processed.shape[0]},
+                    'dpi': dpi,
+                    'format': output_format,
+                    'applied_operations': metadata.get('applied_operations', []),
+                    'rotation_metadata': metadata.get('rotation_metadata', {})
+                }
+            })
+        
+        # Comportamiento anterior: devolver archivo directo
+        img_io.seek(0)
         response = send_file(
             img_io,
             mimetype=mimetype,
@@ -650,17 +355,21 @@ def preprocess_image():
         response.headers['X-Original-Height'] = str(img.shape[0])
         response.headers['X-Processed-Width'] = str(processed.shape[1])
         response.headers['X-Processed-Height'] = str(processed.shape[0])
+        response.headers['X-DPI'] = str(dpi)
         response.headers['X-Applied-Operations'] = ','.join(metadata.get('applied_operations', []))
         
-        if metadata.get('smart_analysis_used'):
-            response.headers['X-Smart-Analysis'] = 'true'
-            response.headers['X-Strategy'] = metadata.get('strategy', 'unknown')
+        # Agregar información de rotación si está disponible
+        rotation_meta = metadata.get('rotation_metadata', {})
+        if rotation_meta.get('auto_rotation_applied'):
+            response.headers['X-Rotation-Degrees'] = str(rotation_meta.get('rotation_degrees', 0))
+        if rotation_meta.get('deskew_applied'):
+            response.headers['X-Deskew-Angle'] = str(rotation_meta.get('deskew_angle_deg', 0.0))
         
         logger.info(
-            "Imagen procesada y devuelta - Original: %dx%d, Procesado: %dx%d, Formato: %s",
+            "Imagen procesada y devuelta - Original: %dx%d, Procesado: %dx%d, Formato: %s, DPI: %d",
             img.shape[1], img.shape[0],
             processed.shape[1], processed.shape[0],
-            output_format
+            output_format, dpi
         )
         
         return response
@@ -670,34 +379,4 @@ def preprocess_image():
         return jsonify({'success': False, 'error': str(exc)}), 400
     except Exception as exc:
         logger.error("Error interno en preprocess-image: %s", exc, exc_info=True)
-        return jsonify({'success': False, 'error': f'Error interno del servidor: {str(exc)}'}), 500
-
-
-@api.route('/extract-pdf-fe', methods=['POST'])
-def extract_pdf_fe_endpoint():
-    """
-    POST /extract-pdf-fe
-    Body: {
-        "pdf_url": "https://...",     # o
-        "pdf_base64": "base64..."
-    }
-    """
-    try:
-        data = request.json or {}
-        if 'pdf_url' in data:
-            pdf_bytes = download_pdf_from_url(data['pdf_url'])
-        elif 'pdf_base64' in data:
-            pdf_bytes = decode_base64_pdf(data['pdf_base64'])
-        else:
-            return jsonify({'error': 'Falta pdf_url o pdf_base64'}), 400
-
-        result = extract_pdf_fe(pdf_bytes)
-        return jsonify(result)
-
-    except ValueError as exc:
-        # PDF sin texto embebido retorna 422 (Unprocessable Entity)
-        logger.warning("Error de validación en extract-pdf-fe: %s", exc)
-        return jsonify({'success': False, 'error': str(exc)}), 422
-    except Exception as exc:
-        logger.error("Error interno en extract-pdf-fe: %s", exc, exc_info=True)
         return jsonify({'success': False, 'error': f'Error interno del servidor: {str(exc)}'}), 500

@@ -25,6 +25,7 @@ ENV/
 tmp_*.py
 *.tmp
 *.log
+temp_files/
 
 # OS
 .DS_Store
@@ -34,3 +35,6 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# PDF files
+*.pdf

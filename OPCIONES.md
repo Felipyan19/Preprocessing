@@ -42,6 +42,9 @@ Debes especificar **una** de estas opciones:
 | `ocr_preserve_details` ⭐ | Preserva detalles finos (suave) | OCR con símbolos (,.*<%) |
 | `ocr_ultra_fine` ⭐⭐ | CLAHE + bilateral + adaptive + morfología | OCR tradicional (Tesseract) |
 | `gemini_vision` ⭐⭐⭐ | **Escala de grises + filtros ultra-suaves** | **Gemini/GPT-Vision/Claude (EVITA ALUCINACIONES)** |
+| `auto` 🤖 | **100% automático: detecta rotación completa + estrategia + crop** | **Cualquier tipo de imagen/PDF** |
+| `grayscale_auto` 🎯 | **Escala de grises + auto-rotación completa (0-90-180-270°)** | **Enderezar tablas automáticamente** |
+| `grayscale_only` | **Solo escala de grises, sin procesamiento** | **Conversión simple sin filtros** |
 | `minimal` | Mínimo procesamiento | Imágenes de alta calidad |
 
 ### Uso:
@@ -161,13 +164,59 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 
 | Opción | Tipo | Default | Descripción |
 |--------|------|---------|-------------|
-| `rotate_180` | `boolean` | `false` | Rota la imagen 180 grados |
+| `rotate_90` | `boolean` | `false` | Rota la imagen 90° sentido horario (manual) |
+| `rotate_180` | `boolean` | `false` | Rota la imagen 180° (manual) |
+| `rotate_270` | `boolean` | `false` | Rota la imagen 270° (manual, equivalente a 90° antihorario) |
+| `auto_rotate_all` 🤖 | `boolean` | `false` | **Detecta automáticamente rotación óptima (0°, 90°, 180°, 270°)** |
+| `auto_detect_rotation` | `boolean` | `false` | Detecta automáticamente solo si está rotada 180° (más rápido) |
 
-**Ejemplo:**
+**Notas:**
+- Solo se puede usar **una** opción de rotación a la vez
+- Prioridad: manual (`rotate_X`) > `auto_rotate_all` > `auto_detect_rotation`
+- **`auto_rotate_all` 🎯 RECOMENDADO:** Detecta automáticamente la mejor orientación analizando:
+  - Densidad de texto en región superior
+  - Presencia de líneas horizontales
+  - Aspect ratio (vertical/horizontal)
+  - Distribución estructurada del contenido
+- `auto_detect_rotation`: Más rápido, solo detecta 180° (imágenes al revés)
+
+**Ejemplo - Rotar 90° (horizontal a vertical):**
+```json
+{
+  "image_url": "https://...",
+  "rotate_90": true
+}
+```
+
+**Ejemplo - Rotar 180° (al revés):**
 ```json
 {
   "image_url": "https://...",
   "rotate_180": true
+}
+```
+
+**Ejemplo - Rotar 270° (vertical a horizontal):**
+```json
+{
+  "image_url": "https://...",
+  "rotate_270": true
+}
+```
+
+**Ejemplo - Auto-detección simple (solo 180°, más rápido):**
+```json
+{
+  "image_url": "https://...",
+  "auto_detect_rotation": true
+}
+```
+
+**Ejemplo - Auto-detección completa (0-90-180-270°, más inteligente) 🤖:**
+```json
+{
+  "image_url": "https://...",
+  "auto_rotate_all": true
 }
 ```
 
@@ -513,6 +562,73 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 }
 ```
 
+### `grayscale_auto` 🤖 (NUEVO)
+**Escala de grises + auto-rotación inteligente completa**
+
+Detecta automáticamente la rotación óptima (0°, 90°, 180°, 270°) y convierte a escala de grises.
+
+```json
+{
+  "convert_to_grayscale": true,
+  "auto_rotate_all": true,
+  "upscale": false,
+  "enhance_contrast": false,
+  "remove_color_bg": false,
+  "deskew": false,
+  "denoise": false,
+  "sharpen": false,
+  "binarize": false,
+  "auto_invert": false,
+  "smart_table_analysis": false,
+  "auto_crop_table": false,
+  "deblur": false
+}
+```
+
+**Caso de uso:**
+- ✅ **Ideal cuando no sabes cómo está rotada la tabla**
+- Analiza automáticamente las 4 orientaciones posibles
+- Elige la mejor basándose en distribución de texto y estructura
+- Sin procesamiento extra, solo conversión y rotación
+
+**Ejemplo de uso:**
+```json
+{
+  "image_url": "https://...",
+  "preset": "grayscale_auto"
+}
+```
+
+### `grayscale_only`
+**Solo escala de grises, sin ningún otro procesamiento**
+
+Para cuando ya sabes la orientación correcta o quieres rotación manual.
+
+```json
+{
+  "convert_to_grayscale": true,
+  "upscale": false,
+  "enhance_contrast": false,
+  "remove_color_bg": false,
+  "deskew": false,
+  "denoise": false,
+  "sharpen": false,
+  "binarize": false,
+  "auto_invert": false,
+  "smart_table_analysis": false,
+  "auto_crop_table": false,
+  "deblur": false
+}
+```
+
+**Uso con rotación manual:**
+```json
+{
+  "preset": "grayscale_only",
+  "rotate_90": true
+}
+```
+
 ### `minimal`
 ```json
 {
@@ -603,6 +719,45 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 **Ventaja:** Bordes más gruesos y definidos  
 **Desventaja:** Puede perder detalles finos (comas, puntos, símbolos)
 
+### Ejemplo 8: Solo Escala de Grises (sin filtros)
+**✅ IDEAL:** Para convertir a escala de grises sin aplicar ningún filtro
+```json
+{
+  "image_url": "https://example.com/tabla.jpg",
+  "preset": "grayscale_only"
+}
+```
+
+### Ejemplo 9: Escala de Grises + Auto-Rotación Inteligente 🤖
+**✅ IDEAL:** Cuando no sabes cómo está rotada la tabla
+```json
+{
+  "image_url": "https://example.com/tabla-rotada.jpg",
+  "preset": "grayscale_auto"
+}
+```
+
+**Ventajas:**
+- ✅ Detecta automáticamente la rotación óptima (0°, 90°, 180°, 270°)
+- ✅ No necesitas saber cómo está orientada la imagen
+- ✅ Analiza distribución de texto y estructura
+- ✅ Solo escala de grises, sin otros filtros
+
+### Ejemplo 10: Escala de Grises + Rotación Manual
+**✅ IDEAL:** Cuando ya sabes la rotación exacta
+```json
+{
+  "image_url": "https://example.com/tabla-rotada.jpg",
+  "preset": "grayscale_only",
+  "rotate_90": true
+}
+```
+
+**Casos de uso:**
+- `rotate_90: true` → Tabla horizontal que necesitas vertical
+- `rotate_180: true` → Tabla al revés (cabeza abajo)
+- `rotate_270: true` → Tabla vertical que necesitas horizontal
+
 ---
 
 ## 📤 Respuesta del Endpoint
@@ -688,6 +843,20 @@ Todas las opciones son **opcionales** y sobrescriben el preset si están definid
 ### Para Detección Automática
 - Usa `preset: "smart_auto"`
 - Deja que el sistema decida la mejor estrategia
+
+### Para Conversión a Escala de Grises
+- **Con auto-rotación:** Usa `preset: "grayscale_auto"` 🎯
+  - Detecta automáticamente la rotación óptima (0-90-180-270°)
+  - **RECOMENDADO** cuando no sabes cómo está orientada la imagen
+  - Analiza distribución de texto, líneas horizontales, aspect ratio
+- **Sin auto-rotación:** Usa `preset: "grayscale_only"`
+  - Cuando ya sabes la orientación correcta
+  - Combina con `rotate_90`, `rotate_180`, o `rotate_270` para rotación manual
+- **Casos de uso:**
+  - Preparar imágenes para procesamiento posterior
+  - Reducir tamaño de archivo manteniendo calidad
+  - Enderezar tablas rotadas automáticamente
+  - Normalizar orientación de múltiples imágenes
 
 ---
 

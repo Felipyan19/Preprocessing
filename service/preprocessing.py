@@ -1,886 +1,805 @@
+# @service/preprocessing.py
 import logging
+from typing import Dict, Tuple, Optional
 
 import cv2
 import numpy as np
+import pytesseract
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# ONLY FEATURE: AUTO-ROTATION (make table "upright")
+# - Primary: Tesseract OSD (Orientation and Script Detection)
+# - Fallback: Table-line structure score analysis
+# - Optionally applies small deskew correction (few degrees)
+# ============================================================
 
-# ============================================
-# OPERACIONES DE PREPROCESAMIENTO
-# ============================================
-
-def enhance_contrast_clahe(img: np.ndarray, clip_limit: float = 3.0, tile_grid_size: tuple = (8, 8)) -> np.ndarray:
+def _detect_orientation_tesseract(img: np.ndarray) -> Optional[int]:
     """
-    CLAHE - muy efectivo para texto blanco sobre fondos de color.
-    
-    Args:
-        clip_limit: Límite de contraste (1.0-5.0). Más bajo = más suave.
-        tile_grid_size: Tamaño de la cuadrícula (default 8x8)
+    Use Tesseract OSD to detect orientation.
+    Returns rotation angle in degrees (0, 90, 180, 270) or None if detection fails.
+
+    Tesseract OSD is production-ready and trained specifically for orientation detection.
+    Much more robust than manual heuristics.
     """
-    if len(img.shape) == 2:
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-        return clahe.apply(img)
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-    l = clahe.apply(l)
-    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    try:
+        # Convert to grayscale if needed
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+
+        # Run Tesseract OSD (Orientation and Script Detection)
+        # --psm 0 = Orientation and script detection (OSD) only
+        osd_result = pytesseract.image_to_osd(gray, config='--psm 0')
+
+        # Parse the OSD output
+        # Example output:
+        # Page number: 0
+        # Orientation in degrees: 180
+        # Rotate: 180
+        # Orientation confidence: 15.24
+        # Script: Latin
+        # Script confidence: 3.24
+
+        lines = osd_result.strip().split('\n')
+        rotation_angle = None
+        confidence = 0.0
+
+        for line in lines:
+            if 'Rotate:' in line:
+                rotation_angle = int(line.split(':')[1].strip())
+            elif 'Orientation confidence:' in line:
+                confidence = float(line.split(':')[1].strip())
+
+        # Only trust if confidence is reasonable (> 1.0)
+        if rotation_angle is not None and confidence > 1.0:
+            logger.info(
+                "Tesseract OSD detected rotation: %d° (confidence: %.2f)",
+                rotation_angle, confidence
+            )
+            return rotation_angle
+        else:
+            logger.warning(
+                "Tesseract OSD low confidence (%.2f) or no rotation detected. Falling back to manual algorithm.",
+                confidence
+            )
+            return None
+
+    except Exception as e:
+        logger.warning("Tesseract OSD failed: %s. Falling back to manual algorithm.", str(e))
+        return None
 
 
-def remove_color_background(img: np.ndarray) -> np.ndarray:
-    """Elimina fondos de color preservando texto claro."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    # Rojo
-    mask_red1 = cv2.inRange(hsv, np.array([0, 50, 50]), np.array([10, 255, 255]))
-    mask_red2 = cv2.inRange(hsv, np.array([170, 50, 50]), np.array([180, 255, 255]))
-    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-
-    # Azul
-    mask_blue = cv2.inRange(hsv, np.array([100, 50, 50]), np.array([130, 255, 255]))
-
-    # Verde
-    mask_green = cv2.inRange(hsv, np.array([35, 50, 50]), np.array([85, 255, 255]))
-
-    # Amarillo/Naranja
-    mask_yellow = cv2.inRange(hsv, np.array([15, 50, 50]), np.array([35, 255, 255]))
-
-    combined = cv2.bitwise_or(mask_red, cv2.bitwise_or(mask_blue, cv2.bitwise_or(mask_green, mask_yellow)))
-    result = img.copy()
-    result[combined > 0] = [255, 255, 255]
-    return result
+def _rotate_90s(img: np.ndarray, deg: int) -> np.ndarray:
+    """Rotate by multiples of 90 degrees."""
+    deg = deg % 360
+    if deg == 0:
+        return img
+    if deg == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if deg == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    if deg == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError("Rotation must be one of {0,90,180,270}.")
 
 
-def extract_text_from_colored_bg(img: np.ndarray) -> np.ndarray:
+def _to_gray(img: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+
+
+def _safe_kernel_width(v: int, min_v: int = 10, max_v: int = 120) -> int:
+    return int(max(min_v, min(max_v, v)))
+
+
+def _table_structure_score(gray: np.ndarray) -> Dict[str, float]:
     """
-    Extrae texto claro (blanco) de fondos de color.
-    Ideal para tablas nutricionales con fondo rojo/azul y texto blanco.
+    Score how 'table-like' and 'upright' this orientation looks.
+    Improved algorithm that better detects rotated tables by:
+      - Detecting text orientation using projection profiles with peak detection
+      - Analyzing line structure more robustly
+      - Using multiple heuristics to determine best orientation
+      - Focusing on table-like structures (rows/columns)
+      - NEW: Top-heavy detection (tables have more content at top)
+      - NEW: Gradient direction analysis (text gradients invert when upside-down)
+      - NEW: Vertical text density distribution analysis
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    inverted = cv2.bitwise_not(gray)
-    _, binary = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    result = cv2.bitwise_not(binary)
-    return result
+    h, w = gray.shape[:2]
 
+    if h < 10 or w < 10:
+        return {"total": 0.0, "horiz": 0.0, "vert": 0.0, "edges": 0.0, "ink": 0.0, "text_orientation": 0.0, "top_heavy": 0.0, "gradient_coherence": 0.0}
 
-def extract_white_text_from_red_bg_advanced(img: np.ndarray) -> np.ndarray:
-    """
-    Pipeline optimizado específicamente para texto BLANCO sobre fondo ROJO borroso.
-    Combina extracción de luminosidad LAB + eliminación de rojo HSV.
+    # Normalize contrast slightly to stabilize edge detection
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    # Morphology to extract horizontal/vertical strokes
+    hk = _safe_kernel_width(w // 25)
+    vk = _safe_kernel_width(h // 25)
+
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk))
+
+    horiz = cv2.morphologyEx(edges, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    vert = cv2.morphologyEx(edges, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+
+    horiz_score = float(np.sum(horiz > 0)) / float(h * w)
+    vert_score = float(np.sum(vert > 0)) / float(h * w)
+    edge_density = float(np.sum(edges > 0)) / float(h * w)
+
+    # Text-ish density: binarize and measure ink
+    _, bin_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    ink_density = float(np.sum(bin_inv > 0)) / float(h * w)
+
+    # IMPROVED: Text orientation detection using projection profiles with peak counting
+    # Horizontal projection (sum of pixels per row) - detects horizontal text lines
+    h_projection = np.sum(bin_inv, axis=1)
+    # Vertical projection (sum of pixels per column) - detects vertical text lines
+    v_projection = np.sum(bin_inv, axis=0)
     
-    Este es el método más efectivo para tablas nutricionales rojas.
-    """
-    # Paso 1: Extraer canal L (luminosidad) del espacio LAB
-    # Esto ignora el color y se enfoca en la intensidad de luz
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
+    # Calculate variance in projections - text lines create peaks/valleys
+    h_proj_variance = float(np.var(h_projection)) if len(h_projection) > 0 else 0.0
+    v_proj_variance = float(np.var(v_projection)) if len(v_projection) > 0 else 0.0
     
-    # Paso 2: Aplicar CLAHE agresivo al canal L para aumentar contraste
-    clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
-    l_enhanced = clahe.apply(l_channel)
+    # Count peaks in projections (more peaks = more text lines = better orientation)
+    # A peak is a local maximum above a threshold
+    h_mean = float(np.mean(h_projection)) if len(h_projection) > 0 else 0.0
+    v_mean = float(np.mean(v_projection)) if len(v_projection) > 0 else 0.0
     
-    # Paso 3: Eliminar fondo rojo usando HSV como máscara adicional
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    # Rangos optimizados para rojos saturados (tablas nutricionales)
-    mask_red1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
-    mask_red2 = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
-    red_mask = cv2.bitwise_or(mask_red1, mask_red2)
+    h_threshold = h_mean * 1.2  # Peaks must be 20% above mean
+    v_threshold = v_mean * 1.2
     
-    # Paso 4: Aplicar la máscara al canal L mejorado
-    # Donde hay rojo (fondo), ponemos blanco
-    l_enhanced[red_mask > 0] = 255
+    h_peaks = np.sum((h_projection[1:-1] > h_projection[:-2]) & 
+                     (h_projection[1:-1] > h_projection[2:]) & 
+                     (h_projection[1:-1] > h_threshold)) if len(h_projection) > 2 else 0
+    v_peaks = np.sum((v_projection[1:-1] > v_projection[:-2]) & 
+                     (v_projection[1:-1] > v_projection[2:]) & 
+                     (v_projection[1:-1] > v_threshold)) if len(v_projection) > 2 else 0
     
-    # Paso 5: Invertir (texto blanco -> texto negro para OCR)
-    inverted = cv2.bitwise_not(l_enhanced)
+    # Normalize by image dimensions
+    h_proj_score = h_proj_variance / (h * h) if h > 0 else 0.0
+    v_proj_score = v_proj_variance / (w * w) if w > 0 else 0.0
     
-    # Paso 6: Binarización Otsu
-    _, binary = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Peak-based score (more peaks = more text lines = better)
+    h_peak_score = float(h_peaks) / float(h) if h > 0 else 0.0
+    v_peak_score = float(v_peaks) / float(w) if w > 0 else 0.0
     
-    # Paso 7: Limpieza con morfología (eliminar ruido pequeño)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # Combined text orientation score: variance + peaks
+    h_text_score = h_proj_score * 0.7 + h_peak_score * 0.3
+    v_text_score = v_proj_score * 0.7 + v_peak_score * 0.3
     
-    # Paso 8: Volver a invertir para tener texto negro sobre fondo blanco
-    result = cv2.bitwise_not(cleaned)
-    
-    logger.info("Aplicado pipeline avanzado: LAB + HSV + CLAHE + morfología")
-    return result
-
-
-def extract_text_adaptive(img: np.ndarray) -> np.ndarray:
-    """Extraccion adaptativa de texto - funciona con texto claro u oscuro."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-
-    binary = cv2.adaptiveThreshold(
-        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 10
-    )
-
-    h, w = binary.shape
-    border_mean = np.mean(
-        [
-            np.mean(binary[0:10, :]),
-            np.mean(binary[-10:, :]),
-            np.mean(binary[:, 0:10]),
-            np.mean(binary[:, -10:]),
-        ]
-    )
-
-    if border_mean < 127:
-        binary = cv2.bitwise_not(binary)
-
-    return binary
-
-
-def adaptive_binarize(img: np.ndarray, method: str = 'otsu', block_size: int = 11, C: int = 2) -> np.ndarray:
-    """
-    Binarización adaptativa.
-    
-    Args:
-        method: 'otsu', 'adaptive_gaussian', 'adaptive_mean'
-        block_size: Tamaño del bloque para adaptive (debe ser impar). Más grande = más suave.
-        C: Constante que se resta del promedio. Más alto = más conservador.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-
-    if method == 'otsu':
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    elif method == 'adaptive_gaussian':
-        # Asegurar que block_size es impar
-        if block_size % 2 == 0:
-            block_size += 1
-        binary = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            block_size,
-            C,
-        )
-    elif method == 'adaptive_mean':
-        if block_size % 2 == 0:
-            block_size += 1
-        binary = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY,
-            block_size,
-            C,
-        )
+    # Determine if text is horizontal or vertical
+    if h_text_score > v_text_score * 1.1:  # At least 10% better
+        # Horizontal text (normal orientation)
+        text_orientation_score = h_text_score / (v_text_score + 1e-6) if v_text_score > 0 else h_text_score * 10
+        text_is_horizontal = True
+    elif v_text_score > h_text_score * 1.1:
+        # Vertical text (rotated 90°)
+        text_orientation_score = v_text_score / (h_text_score + 1e-6) if h_text_score > 0 else v_text_score * 10
+        text_is_horizontal = False
     else:
-        _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-    return binary
+        # Ambiguous - use variance ratio
+        if h_proj_variance > v_proj_variance:
+            text_orientation_score = h_proj_variance / (v_proj_variance + 1e-6)
+            text_is_horizontal = True
+        else:
+            text_orientation_score = v_proj_variance / (h_proj_variance + 1e-6)
+            text_is_horizontal = False
+    
+    # Normalize text orientation score
+    text_orientation_normalized = min(text_orientation_score / 10.0, 1.0) if text_orientation_score > 0 else 0.0
+
+    # ============================================================
+    # NEW HEURISTICS FOR BETTER 180° DETECTION
+    # ============================================================
+
+    # 1. TOP-HEAVY DETECTION (IMPROVED)
+    # Tables typically have headers at top, but we need to exclude barcodes/dense graphics
+    # Strategy: Use narrow bands at very top and very bottom (5% each) to avoid middle content
+
+    top_band_height = max(int(h * 0.05), 10)  # Top 5% or at least 10 pixels
+    bottom_band_height = max(int(h * 0.05), 10)  # Bottom 5%
+
+    top_band = bin_inv[:top_band_height, :]
+    bottom_band = bin_inv[-bottom_band_height:, :]
+
+    # Also analyze middle section to detect barcodes (very high horizontal line density)
+    middle_start = int(h * 0.3)
+    middle_end = int(h * 0.7)
+    middle_section = bin_inv[middle_start:middle_end, :]
+
+    # Calculate densities
+    top_density = float(np.sum(top_band > 0)) / float(top_band.size) if top_band.size > 0 else 0.0
+    bottom_density = float(np.sum(bottom_band > 0)) / float(bottom_band.size) if bottom_band.size > 0 else 0.0
+    middle_density = float(np.sum(middle_section > 0)) / float(middle_section.size) if middle_section.size > 0 else 0.0
+
+    # Detect barcode-like patterns in top and bottom bands
+    # Barcodes have VERY high horizontal line density (vertical bars) and are CONSISTENT
+    def has_barcode_pattern(region):
+        if region.size == 0:
+            return False
+        # Count transitions per row (black-white-black-white pattern)
+        row_transitions = []
+        for row in region[:min(len(region), 50)]:  # Sample first 50 rows
+            if len(row) < 10:
+                continue
+            transitions = np.sum(np.abs(np.diff(row > 128))) # Count transitions
+            row_transitions.append(transitions)
+
+        if len(row_transitions) < 10:  # Need at least 10 rows
+            return False
+
+        avg_transitions = float(np.mean(row_transitions))
+        std_transitions = float(np.std(row_transitions))
+
+        # Barcodes have:
+        # 1. VERY high transitions (>60 per row typically, not just 20)
+        # 2. LOW variance (consistent pattern across rows)
+        has_high_transitions = avg_transitions > 60
+        has_low_variance = std_transitions < (avg_transitions * 0.3)  # Variance < 30% of mean
+
+        return has_high_transitions and has_low_variance
+
+    top_has_barcode = has_barcode_pattern(top_band)
+    bottom_has_barcode = has_barcode_pattern(bottom_band)
+
+    # Debug logging for barcode detection
+    logger.debug(
+        "Barcode detection - top_has_barcode=%s, bottom_has_barcode=%s, top_density=%.5f, bottom_density=%.5f",
+        top_has_barcode, bottom_has_barcode, top_density, bottom_density
+    )
+
+    # If top has barcode, it's likely upside down (barcodes usually at bottom)
+    # If bottom has barcode, it's likely correct orientation
+    if top_has_barcode and not bottom_has_barcode:
+        # Likely upside down - penalize this orientation
+        top_heavy_score = -0.8  # Strong signal that this is wrong
+    elif bottom_has_barcode and not top_has_barcode:
+        # Likely correct - reward this orientation
+        top_heavy_score = 0.8  # Strong signal that this is correct
+    else:
+        # No clear barcode signal, use SMARTER density comparison
+        # Instead of just comparing densities, analyze the PATTERN
+
+        # For nutrition tables, typically:
+        # - Top 10% has brand/title (medium-high density)
+        # - Next 10-30% has table content (high density, structured)
+        # - Bottom 10% might have legal text or codes (low-medium density)
+
+        # Split into finer bands
+        band_10 = max(int(h * 0.10), 10)
+        very_top = bin_inv[:band_10, :]  # First 10%
+        very_bottom = bin_inv[-band_10:, :]  # Last 10%
+
+        very_top_density = float(np.sum(very_top > 0)) / float(very_top.size) if very_top.size > 0 else 0.0
+        very_bottom_density = float(np.sum(very_bottom > 0)) / float(very_bottom.size) if very_bottom.size > 0 else 0.0
+
+        # Analyze row density variance in top vs bottom quarters
+        top_quarter = bin_inv[:h//4, :]
+        bottom_quarter = bin_inv[-h//4:, :]
+
+        top_row_densities = np.sum(top_quarter, axis=1) / float(w) if w > 0 else np.zeros(len(top_quarter))
+        bottom_row_densities = np.sum(bottom_quarter, axis=1) / float(w) if w > 0 else np.zeros(len(bottom_quarter))
+
+        top_quarter_variance = float(np.var(top_row_densities))
+        bottom_quarter_variance = float(np.var(bottom_row_densities))
+
+        # Correct orientation typically has:
+        # 1. Higher variance at top (title + table start = varied density)
+        # 2. Lower variance at bottom (uniform legal text or empty space)
+        variance_ratio = top_quarter_variance / (bottom_quarter_variance + 1e-6)
+
+        # Combine density difference with variance ratio
+        density_diff = very_top_density - very_bottom_density
+
+        # Weighted combination
+        if variance_ratio > 1.3:  # Top has significantly more structure
+            top_heavy_score = 0.3 + (density_diff * 0.3)  # Bias toward this being correct
+        elif variance_ratio < 0.7:  # Bottom has more structure (likely inverted)
+            top_heavy_score = -0.3 + (density_diff * 0.3)  # Bias toward this being inverted
+        else:
+            # Ambiguous, use density only
+            top_heavy_raw = (top_density - bottom_density) / (top_density + bottom_density + 1e-6)
+            top_heavy_score = float(top_heavy_raw) * 0.4
+
+    # Normalize to [0, 1] range where 1 = very top-heavy (correct orientation)
+    top_heavy_normalized = max(0.0, min(1.0, (top_heavy_score + 1.0) / 2.0))
+
+    # 2. GRADIENT DIRECTION ANALYSIS
+    # Text has characteristic gradients that invert when upside-down
+    # Use Sobel to detect vertical gradient direction
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+
+    # Calculate gradient magnitude and direction
+    gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+    gradient_dir = np.arctan2(sobely, sobelx)  # Range: [-π, π]
+
+    # Focus on strong gradients (likely from text edges)
+    strong_gradients_mask = gradient_mag > np.percentile(gradient_mag, 75)
+
+    if np.sum(strong_gradients_mask) > 100:
+        # Analyze vertical component of gradients
+        # Positive sobely = gradient points downward (dark-to-light going down)
+        # Negative sobely = gradient points upward (dark-to-light going up)
+        # For normal text (dark on light), top edge has negative gradient, bottom has positive
+        # For inverted text, this flips
+
+        strong_sobely = sobely[strong_gradients_mask]
+
+        # Calculate asymmetry in vertical gradients
+        # Normal text should have balanced but slightly top-biased gradients
+        positive_grad_count = np.sum(strong_sobely > 0)
+        negative_grad_count = np.sum(strong_sobely < 0)
+        total_strong = len(strong_sobely)
+
+        # For white text on dark background (like your table), the gradient pattern is different
+        # We look for coherence/consistency rather than specific direction
+        gradient_balance = abs(positive_grad_count - negative_grad_count) / float(total_strong)
+
+        # Higher coherence = more consistent gradient direction = more likely correct orientation
+        gradient_coherence = 1.0 - gradient_balance  # Range [0, 1], higher = better
+    else:
+        gradient_coherence = 0.5  # Neutral if not enough gradients
+
+    # 3. VERTICAL TEXT DENSITY DISTRIBUTION
+    # Analyze how text density changes from top to bottom
+    # Tables typically have higher density at top (headers) then periodic rows
+    row_densities = np.sum(bin_inv, axis=1) / float(w) if w > 0 else np.zeros(h)
+
+    # Calculate variance in top half vs bottom half
+    mid = h // 2
+    top_half_variance = float(np.var(row_densities[:mid])) if mid > 0 else 0.0
+    bottom_half_variance = float(np.var(row_densities[mid:])) if mid > 0 else 0.0
+
+    # Tables often have more structured variance in top portion (header + first rows)
+    # This is a weak signal but helps in tie-breaking
+    variance_ratio = top_half_variance / (bottom_half_variance + 1e-6) if bottom_half_variance > 0 else 1.0
+    variance_score = min(1.0, variance_ratio / 2.0)  # Normalize
+
+    # Improved dominance: consider both line structure and text orientation
+    line_dominance = horiz_score - (0.85 * vert_score)
+    
+    # When text is horizontal, prefer horizontal dominance
+    # When text is vertical (rotated 90°), prefer vertical dominance (which becomes horizontal after rotation)
+    if text_is_horizontal:
+        # Normal case: horizontal text, prefer horizontal lines
+        dominance = (line_dominance * 0.5) + (text_orientation_normalized * 0.5)
+    else:
+        # Rotated 90° case: vertical text, prefer vertical lines (which will be horizontal after rotation)
+        inverted_line_dominance = vert_score - (0.85 * horiz_score)
+        dominance = (inverted_line_dominance * 0.5) + (text_orientation_normalized * 0.5)
+
+    # Final score: mix ALL features including new heuristics
+    # Rebalanced weights to incorporate top-heavy and gradient detection
+    base_score = (
+        dominance * 0.35 +                      # Structure and text orientation (reduced from 0.50)
+        edge_density * 0.15 +                   # Overall edge density (reduced from 0.20)
+        min(ink_density, 0.25) * 0.10 +        # Text density (reduced from 0.15)
+        text_orientation_normalized * 0.10      # Text orientation (reduced from 0.15)
+    )
+
+    # NEW: Add orientation-specific heuristics (30% total weight)
+    orientation_score = (
+        top_heavy_normalized * 0.20 +           # Top-heavy detection (STRONG signal for 180°)
+        gradient_coherence * 0.05 +             # Gradient coherence (medium signal)
+        variance_score * 0.05                   # Variance distribution (weak signal)
+    )
+
+    total = base_score + orientation_score
+
+    # Bonus: If text orientation is very strong, boost the score
+    if text_orientation_normalized > 0.3:
+        total *= 1.15  # 15% boost (reduced from 25% to balance with new heuristics)
+
+    # Bonus: If we have many peaks (clear text lines), boost the score
+    if text_is_horizontal and h_peaks > 5:
+        total *= 1.08  # 8% boost (reduced from 10%)
+    elif not text_is_horizontal and v_peaks > 5:
+        total *= 1.08  # 8% boost (reduced from 10%)
+
+    # CRITICAL BONUS: If very top-heavy (clear header at top), boost significantly
+    # This helps distinguish 0° from 180° even when other scores are similar
+    if top_heavy_normalized > 0.65:  # Strong top-heavy signal
+        total *= 1.35  # 35% boost for very clear top-heavy orientation
+
+    return {
+        "total": total,
+        "horiz": horiz_score,
+        "vert": vert_score,
+        "edges": edge_density,
+        "ink": ink_density,
+        "text_orientation": text_orientation_normalized,
+        "top_heavy": top_heavy_normalized,
+        "gradient_coherence": gradient_coherence,
+        "variance_score": variance_score,
+        "barcode_detected_top": top_has_barcode,
+        "barcode_detected_bottom": bottom_has_barcode,
+    }
 
 
-def deskew_image(img: np.ndarray) -> np.ndarray:
-    """Corrige rotacion/inclinacion."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+def _estimate_small_skew_angle(gray: np.ndarray, max_abs_deg: float = 10.0) -> float:
+    """
+    Estimate small skew (few degrees) based on dominant line angles.
+    Returns angle in degrees to rotate (positive = counter-clockwise).
+    """
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blur, 50, 150)
 
-    coords = np.column_stack(np.where(binary > 0))
-    if len(coords) < 10:
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=80,
+        minLineLength=max(40, gray.shape[1] // 8),
+        maxLineGap=10,
+    )
+
+    if lines is None or len(lines) < 5:
+        return 0.0
+
+    angles = []
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx = (x2 - x1)
+        dy = (y2 - y1)
+        if dx == 0 and dy == 0:
+            continue
+        angle = np.degrees(np.arctan2(dy, dx))  # [-180, 180]
+        # Normalize so near-horizontal angles cluster around 0
+        # e.g. 179 -> -1, -179 -> 1
+        if angle > 90:
+            angle -= 180
+        elif angle < -90:
+            angle += 180
+        # Keep only near-horizontal lines (most relevant for table rows)
+        if abs(angle) <= 30:
+            angles.append(angle)
+
+    if len(angles) < 5:
+        return 0.0
+
+    # Robust central tendency
+    angle_med = float(np.median(angles))
+    if abs(angle_med) < 0.3:
+        return 0.0
+    if abs(angle_med) > max_abs_deg:
+        return 0.0
+    return angle_med
+
+
+def _rotate_arbitrary(img: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Rotate image by an arbitrary small angle preserving full canvas."""
+    if abs(angle_deg) < 1e-6:
         return img
 
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = 90 + angle
-    elif angle > 45:
-        angle = angle - 90
+    h, w = img.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
 
-    if abs(angle) < 0.5:
-        return img
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
 
-    (h, w) = img.shape[:2]
-    center = (w // 2, h // 2)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    M[0, 2] += (new_w / 2.0) - center[0]
+    M[1, 2] += (new_h / 2.0) - center[1]
 
-    cos, sin = np.abs(matrix[0, 0]), np.abs(matrix[0, 1])
-    new_w, new_h = int((h * sin) + (w * cos)), int((h * cos) + (w * sin))
-    matrix[0, 2] += (new_w / 2) - center[0]
-    matrix[1, 2] += (new_h / 2) - center[1]
-
-    logger.info("Rotando %.2f grados", angle)
     return cv2.warpAffine(
         img,
-        matrix,
+        M,
         (new_w, new_h),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE,
     )
 
 
-def denoise_image(img: np.ndarray, method: str = 'bilateral', d: int = 9, sigma_color: float = 75, sigma_space: float = 75) -> np.ndarray:
+def auto_rotate_table_upright(
+    img: np.ndarray,
+    *,
+    enable_deskew: bool = True,
+    deskew_max_abs_deg: float = 8.0,
+    min_improvement: float = 0.0,  # Set to 0 for maximum aggressiveness - always rotate if best != 0°
+    use_tesseract: bool = True,  # Try Tesseract OSD first
+) -> Tuple[np.ndarray, Dict]:
     """
-    Reduce ruido.
-    
-    Args:
-        method: 'bilateral', 'gaussian', 'nlm'
-        d: Diámetro del filtro bilateral (5-9 típico)
-        sigma_color: Filtro en espacio de color (más bajo = más selectivo)
-        sigma_space: Filtro en espacio de coordenadas
-    """
-    if method == 'gaussian':
-        return cv2.GaussianBlur(img, (5, 5), 0)
-    if method == 'bilateral':
-        return cv2.bilateralFilter(img, d, sigma_color, sigma_space)
-    if method == 'nlm':
-        if len(img.shape) == 3:
-            return cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
-        return cv2.fastNlMeansDenoising(img, None, 10, 7, 21)
-    return img
+    Auto-rotate image so table becomes upright.
 
-
-def upscale_image(img: np.ndarray, scale: float = 2.0, method: str = 'cubic') -> np.ndarray:
-    """
-    Agranda imagen pequeña.
-    
-    Args:
-        img: Imagen a escalar
-        scale: Factor de escalado
-        method: 'cubic' (default), 'lanczos4' (mejor calidad para texto pequeño), 'linear'
-    """
-    if method == 'lanczos4':
-        # Lanczos4 preserva mejor los detalles finos (texto pequeño)
-        return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
-    elif method == 'linear':
-        return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-    else:
-        return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-
-def sharpen_image(img: np.ndarray, strength: float = 1.0, method: str = 'kernel') -> np.ndarray:
-    """
-    Aumenta nitidez.
-    
-    Args:
-        img: Imagen a procesar
-        strength: Intensidad del sharpening
-        method: 'kernel' (rápido), 'unsharp' (mejor calidad para texto pequeño)
-    """
-    if method == 'unsharp':
-        # Unsharp mask - mejor para texto pequeño
-        gaussian = cv2.GaussianBlur(img, (0, 0), 1.0)
-        sharpened = cv2.addWeighted(img, 1.0 + strength, gaussian, -strength, 0)
-        return sharpened
-    else:
-        # Kernel tradicional
-        kernel = np.array([[-1, -1, -1], [-1, 9 + strength, -1], [-1, -1, -1]])
-        return cv2.filter2D(img, -1, kernel)
-
-
-def deblur_image(img: np.ndarray, method: str = 'unsharp', strength: float = 1.0) -> np.ndarray:
-    """
-    Reduce borrosidad de la imagen.
-    Especialmente efectivo para tablas con texto borroso.
-    
-    Args:
-        img: Imagen a procesar
-        method: 'unsharp', 'laplacian', 'aggressive' (para texto muy pequeño)
-        strength: Factor de intensidad (0.5-2.0)
-    """
-    if method == 'aggressive':
-        # Deblurring agresivo para texto muy pequeño y pegado
-        # Paso 1: Unsharp mask fuerte
-        gaussian = cv2.GaussianBlur(img, (0, 0), 3.0)
-        unsharp = cv2.addWeighted(img, 1.5 * strength, gaussian, -0.5 * strength, 0)
-        
-        # Paso 2: High-pass filter para resaltar bordes
-        if len(unsharp.shape) == 3:
-            gray = cv2.cvtColor(unsharp, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = unsharp
-        
-        # Aplicar filtro high-pass
-        kernel_size = 3
-        kernel = np.array([
-            [-1, -1, -1],
-            [-1,  9, -1],
-            [-1, -1, -1]
-        ]) * (0.3 * strength)
-        kernel[1, 1] = 1 + kernel[1, 1]
-        
-        if len(img.shape) == 3:
-            sharpened = cv2.filter2D(unsharp, -1, kernel)
-        else:
-            sharpened = cv2.filter2D(gray, -1, kernel)
-        
-        return sharpened
-        
-    elif method == 'unsharp':
-        # Unsharp masking - muy efectivo para borrosidad
-        gaussian = cv2.GaussianBlur(img, (0, 0), 2.0)
-        unsharp = cv2.addWeighted(img, 1.0 + strength, gaussian, -strength, 0)
-        return unsharp
-    elif method == 'laplacian':
-        # Sharpening con Laplacian
-        if len(img.shape) == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = img
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        laplacian = np.uint8(np.absolute(laplacian))
-        if len(img.shape) == 3:
-            sharpened = cv2.addWeighted(img, 1.0 + 0.5 * strength, cv2.cvtColor(laplacian, cv2.COLOR_GRAY2BGR), -0.5 * strength, 0)
-        else:
-            sharpened = cv2.addWeighted(img, 1.0 + 0.5 * strength, laplacian, -0.5 * strength, 0)
-        return sharpened
-    return img
-
-
-def invert_if_dark(img: np.ndarray) -> np.ndarray:
-    """Invierte si el fondo es oscuro."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    if np.mean(gray) < 127:
-        logger.info("Invirtiendo imagen (fondo oscuro)")
-        return cv2.bitwise_not(img)
-    return img
-
-
-def apply_morphology(img: np.ndarray, mode: str = 'open', kernel_size: tuple = (2, 2), iterations: int = 1) -> np.ndarray:
-    """
-    Aplica operaciones morfológicas para limpiar la imagen binarizada.
-    
-    Args:
-        mode: 'open' (elimina ruido pequeño), 'close' (rellena huecos), 'erode', 'dilate'
-        kernel_size: Tamaño del kernel (ancho, alto)
-        iterations: Número de veces que se aplica la operación
-    """
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
-    
-    if mode == 'open':
-        return cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel, iterations=iterations)
-    elif mode == 'close':
-        return cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel, iterations=iterations)
-    elif mode == 'erode':
-        return cv2.erode(img, kernel, iterations=iterations)
-    elif mode == 'dilate':
-        return cv2.dilate(img, kernel, iterations=iterations)
-    else:
-        return img
-
-
-# ============================================
-# ANÁLISIS DINÁMICO DE COLOR PARA TABLAS
-# ============================================
-
-def detect_table_regions(img: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """
-    Detecta regiones rectangulares que contengan tablas.
-    Retorna lista de bounding boxes: [(x, y, w, h), ...]
-    Si no detecta nada, retorna la imagen completa.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    h, w = gray.shape
-
-    # Detectar bordes
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-
-    # Detectar líneas horizontales y verticales (características de tablas)
-    kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 30, 1))
-    kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, h // 30))
-
-    horizontal_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_horizontal)
-    vertical_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_vertical)
-
-    # Combinar líneas
-    table_structure = cv2.add(horizontal_lines, vertical_lines)
-
-    # Dilatar para conectar regiones
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    dilated = cv2.dilate(table_structure, kernel, iterations=2)
-
-    # Encontrar contornos
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    regions = []
-    min_area = (w * h) * 0.05  # Al menos 5% del área total
-
-    for contour in contours:
-        x, y, cw, ch = cv2.boundingRect(contour)
-        area = cw * ch
-
-        # Filtrar regiones muy pequeñas o que ocupan casi toda la imagen
-        if area > min_area and area < (w * h) * 0.95:
-            # Expandir ligeramente la región para capturar todo el contenido
-            margin = 10
-            x = max(0, x - margin)
-            y = max(0, y - margin)
-            cw = min(w - x, cw + 2 * margin)
-            ch = min(h - y, ch + 2 * margin)
-            regions.append((x, y, cw, ch))
-
-    # Si no se detectaron regiones, usar toda la imagen
-    if not regions:
-        logger.info("No se detectaron regiones de tabla, usando imagen completa")
-        return [(0, 0, w, h)]
-
-    logger.info("Detectadas %d regiones de tabla", len(regions))
-    return regions
-
-
-def analyze_text_and_background_colors(img: np.ndarray, region: tuple[int, int, int, int] | None = None) -> dict:
-    """
-    Analiza colores dominantes del texto y fondo en una región.
+    Steps:
+    1) Try Tesseract OSD (Orientation and Script Detection) first - most reliable
+    2) If Tesseract fails, score 0/90/180/270 and pick best using manual algorithm
+    3) If enabled, apply small deskew (few degrees) using Hough line angles
 
     Args:
-        img: Imagen BGR
-        region: (x, y, w, h) o None para toda la imagen
+        enable_deskew: whether to do small-angle correction after 90° rotation
+        deskew_max_abs_deg: maximum absolute deskew degrees to apply
+        min_improvement: if best orientation isn't better than original by this ratio, keep original
+        use_tesseract: whether to try Tesseract OSD first (recommended)
 
     Returns:
-        dict con:
-            - text_color: (R, G, B)
-            - text_luminosity: 0.0-1.0
-            - bg_color: (R, G, B)
-            - bg_luminosity: 0.0-1.0
-            - contrast: 0.0-1.0
+        (rotated_img, metadata)
     """
-    # Extraer región de interés
-    if region:
-        x, y, w, h = region
-        roi = img[y:y+h, x:x+w].copy()
-    else:
-        roi = img.copy()
-
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-
-    # Detectar bordes para identificar texto
-    edges = cv2.Canny(gray, 50, 150)
-
-    # Dilatar bordes para capturar área de texto
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    text_mask = cv2.dilate(edges, kernel, iterations=2)
-
-    # Invertir para obtener máscara de fondo
-    bg_mask = cv2.bitwise_not(text_mask)
-
-    # Calcular color promedio del texto
-    text_pixels = roi[text_mask > 0]
-    if len(text_pixels) > 0:
-        text_color = np.mean(text_pixels, axis=0).astype(int)
-        text_gray = np.mean(gray[text_mask > 0])
-    else:
-        # Fallback: usar píxeles más oscuros o más claros
-        threshold = np.median(gray)
-        if np.mean(gray) > 127:
-            # Imagen clara, texto probablemente oscuro
-            text_color = np.mean(roi[gray < threshold], axis=0).astype(int) if np.any(gray < threshold) else np.array([0, 0, 0])
-            text_gray = np.mean(gray[gray < threshold]) if np.any(gray < threshold) else 0
-        else:
-            # Imagen oscura, texto probablemente claro
-            text_color = np.mean(roi[gray > threshold], axis=0).astype(int) if np.any(gray > threshold) else np.array([255, 255, 255])
-            text_gray = np.mean(gray[gray > threshold]) if np.any(gray > threshold) else 255
-
-    # Calcular color promedio del fondo
-    bg_pixels = roi[bg_mask > 0]
-    if len(bg_pixels) > 50:  # Necesitamos suficientes píxeles
-        bg_color = np.mean(bg_pixels, axis=0).astype(int)
-        bg_gray = np.mean(gray[bg_mask > 0])
-    else:
-        # Fallback: usar color promedio global
-        bg_color = np.mean(roi.reshape(-1, 3), axis=0).astype(int)
-        bg_gray = np.mean(gray)
-
-    # Calcular luminosidad (0.0 = negro, 1.0 = blanco)
-    text_luminosity = float(text_gray) / 255.0
-    bg_luminosity = float(bg_gray) / 255.0
-
-    # Calcular contraste
-    contrast = abs(text_luminosity - bg_luminosity)
-
-    analysis = {
-        'text_color': tuple(int(c) for c in text_color[::-1]),  # BGR -> RGB
-        'text_luminosity': text_luminosity,
-        'bg_color': tuple(int(c) for c in bg_color[::-1]),  # BGR -> RGB
-        'bg_luminosity': bg_luminosity,
-        'contrast': contrast,
+    best_deg = 0
+    meta: Dict = {
+        "auto_rotation_applied": False,
+        "rotation_degrees": 0,
+        "scores": {},
+        "improvement_ratio": 0.0,
+        "deskew_applied": False,
+        "deskew_angle_deg": 0.0,
+        "method": "none",
     }
 
+    # Step 1: Try Tesseract OSD first (production-ready, very reliable)
+    if use_tesseract:
+        tesseract_rotation = _detect_orientation_tesseract(img)
+        if tesseract_rotation is not None:
+            best_deg = tesseract_rotation
+            meta["method"] = "tesseract_osd"
+            meta["auto_rotation_applied"] = (best_deg != 0)
+            meta["rotation_degrees"] = best_deg
+
+            logger.info(
+                "Using Tesseract OSD result: %d° rotation detected",
+                best_deg
+            )
+
+            # Apply rotation and proceed to deskew
+            out = _rotate_90s(img, best_deg)
+
+            # Optional small-angle deskew after coarse rotation
+            if enable_deskew:
+                gray = _to_gray(out)
+                angle = _estimate_small_skew_angle(gray, max_abs_deg=deskew_max_abs_deg)
+
+                # We want to counter the skew => rotate by -angle
+                if abs(angle) >= 0.3:
+                    out = _rotate_arbitrary(out, -angle)
+                    meta["deskew_applied"] = True
+                    meta["deskew_angle_deg"] = float(angle)
+                    logger.info("Deskew applied: %.2f° (rotated by %.2f°)", angle, -angle)
+
+            logger.info("Auto-rotation result (Tesseract): %d° (deskew=%s)", meta["rotation_degrees"], meta["deskew_applied"])
+            return out, meta
+
+    # Step 2: Fallback to manual algorithm if Tesseract failed or disabled
+    logger.info("Using manual orientation detection algorithm (fallback)")
+    meta["method"] = "manual_heuristics"
+
+    gray0 = _to_gray(img)
+
+    candidates = {}
+    for deg in (0, 90, 180, 270):
+        rot = _rotate_90s(gray0, deg)
+        candidates[deg] = _table_structure_score(rot)
+
+    # Get scores for all orientations
+    score_0 = candidates[0]["total"]
+    score_90 = candidates[90]["total"]
+    score_180 = candidates[180]["total"]
+    score_270 = candidates[270]["total"]
+    
+    # Find best orientation
+    best_deg = max(candidates, key=lambda d: candidates[d]["total"])
+    best_score = candidates[best_deg]["total"]
+    base_score = score_0
+    
+    # Log scores for debugging
     logger.info(
-        "Análisis de color - Texto: RGB%s (L=%.2f), Fondo: RGB%s (L=%.2f), Contraste: %.2f",
-        analysis['text_color'],
-        text_luminosity,
-        analysis['bg_color'],
-        bg_luminosity,
-        contrast,
+        "Rotation scores - 0°: %.5f, 90°: %.5f, 180°: %.5f, 270°: %.5f (best: %d°)",
+        score_0, score_90, score_180, score_270, best_deg
     )
-
-    return analysis
-
-
-def decide_conversion_strategy(analysis: dict) -> str:
-    """
-    Decide la estrategia de conversión basada en el análisis de colores.
-
-    Estrategias:
-        - 'white_on_black': Texto claro sobre fondo oscuro
-        - 'black_on_white': Texto oscuro sobre fondo claro
-        - 'enhance_contrast': Bajo contraste, aumentar primero
-        - 'extract_luminosity': Fondo de color saturado
-        - 'red_background_advanced': Fondo rojo específicamente (MEJOR para tablas nutricionales)
-        - 'invert_colors': Invertir todo
-    """
-    text_lum = analysis['text_luminosity']
-    bg_lum = analysis['bg_luminosity']
-    contrast = analysis['contrast']
-
-    # Detectar si el fondo es de color saturado
-    bg_r, bg_g, bg_b = analysis['bg_color']
-    bg_saturation = (max(bg_r, bg_g, bg_b) - min(bg_r, bg_g, bg_b)) / 255.0
     
-    # NUEVO: Detectar específicamente fondo ROJO (tablas nutricionales)
-    # Rojo: R alto, G y B bajos
-    is_red_background = (bg_r > 150 and bg_g < 100 and bg_b < 100) or \
-                       (bg_r > bg_g + 80 and bg_r > bg_b + 80)
+    # Calculate improvement
+    improvement = 0.0
+    if abs(base_score) > 1e-9:
+        improvement = (best_score - base_score) / abs(base_score)
+    else:
+        improvement = 1.0 if best_deg != 0 else 0.0
+
+    # Improved rotation logic: Always prefer 90°/270° when they have good scores
+    should_rotate = False
+    final_deg = best_deg
     
-    # Detectar texto blanco: luminosidad alta
-    is_white_text = text_lum > 0.7
+    # Improved logic: Check all possible scenarios and choose the best orientation
+    # Tolerance for "ties" - scores very close to each other
+    tolerance = max(best_score * 0.02, 0.001)  # 2% of best score or 0.001, whichever is larger
     
-    # ESTRATEGIA PRIORITARIA: Fondo rojo + texto blanco
-    if is_red_background and is_white_text:
-        logger.info("Estrategia: red_background_advanced (fondo rojo detectado R=%d, texto blanco L=%.2f)", 
-                   bg_r, text_lum)
-        return 'red_background_advanced'
+    # Find all orientations within tolerance of the best score
+    close_scores = [d for d in [0, 90, 180, 270] if abs(candidates[d]["total"] - best_score) <= tolerance]
+    
+    # Log detailed scores for debugging (including NEW heuristics + barcode detection)
+    logger.info(
+        "Detailed scores - 0°: %.5f (h=%.5f, v=%.5f, txt=%.5f, top=%.5f, grad=%.5f, bc_t=%s, bc_b=%s), "
+        "90°: %.5f (h=%.5f, v=%.5f, txt=%.5f, top=%.5f, grad=%.5f, bc_t=%s, bc_b=%s), "
+        "180°: %.5f (h=%.5f, v=%.5f, txt=%.5f, top=%.5f, grad=%.5f, bc_t=%s, bc_b=%s), "
+        "270°: %.5f (h=%.5f, v=%.5f, txt=%.5f, top=%.5f, grad=%.5f, bc_t=%s, bc_b=%s)",
+        score_0, candidates[0].get("horiz", 0), candidates[0].get("vert", 0), candidates[0].get("text_orientation", 0),
+        candidates[0].get("top_heavy", 0), candidates[0].get("gradient_coherence", 0),
+        candidates[0].get("barcode_detected_top", False), candidates[0].get("barcode_detected_bottom", False),
+        score_90, candidates[90].get("horiz", 0), candidates[90].get("vert", 0), candidates[90].get("text_orientation", 0),
+        candidates[90].get("top_heavy", 0), candidates[90].get("gradient_coherence", 0),
+        candidates[90].get("barcode_detected_top", False), candidates[90].get("barcode_detected_bottom", False),
+        score_180, candidates[180].get("horiz", 0), candidates[180].get("vert", 0), candidates[180].get("text_orientation", 0),
+        candidates[180].get("top_heavy", 0), candidates[180].get("gradient_coherence", 0),
+        candidates[180].get("barcode_detected_top", False), candidates[180].get("barcode_detected_bottom", False),
+        score_270, candidates[270].get("horiz", 0), candidates[270].get("vert", 0), candidates[270].get("text_orientation", 0),
+        candidates[270].get("top_heavy", 0), candidates[270].get("gradient_coherence", 0),
+        candidates[270].get("barcode_detected_top", False), candidates[270].get("barcode_detected_bottom", False)
+    )
+    
+    # Decision logic: prioritize based on NEW heuristics when there are ties
+    if len(close_scores) > 1:
+        # Multiple orientations have similar scores - use orientation-specific heuristics to break tie
+        # Priority: top_heavy > text_orientation > gradient_coherence
 
-    # Bajo contraste: necesita mejora
-    if contrast < 0.3:
-        logger.info("Estrategia: enhance_contrast (contraste bajo: %.2f)", contrast)
-        return 'enhance_contrast'
+        best_top_heavy = -1.0
+        best_by_top_heavy = 0
 
-    # Fondo de color saturado genérico
-    if bg_saturation > 0.4 and contrast > 0.3:
-        logger.info("Estrategia: extract_luminosity (fondo saturado: %.2f)", bg_saturation)
-        return 'extract_luminosity'
+        # First, try to break tie using top_heavy score (most reliable for 0° vs 180°)
+        for deg in close_scores:
+            top_heavy = candidates[deg].get("top_heavy", 0.0)
+            if top_heavy > best_top_heavy:
+                best_top_heavy = top_heavy
+                best_by_top_heavy = deg
 
-    # Texto claro sobre fondo oscuro
-    if text_lum > 0.6 and bg_lum < 0.5:
-        logger.info("Estrategia: white_on_black (texto claro sobre fondo oscuro)")
-        return 'white_on_black'
-
-    # Texto oscuro sobre fondo claro
-    if text_lum < 0.5 and bg_lum > 0.6:
-        logger.info("Estrategia: black_on_white (texto oscuro sobre fondo claro)")
-        return 'black_on_white'
-
-    # Invertido: texto oscuro sobre fondo claro pero al revés
-    if text_lum < 0.5 and bg_lum < 0.5:
-        logger.info("Estrategia: invert_colors (ambos oscuros, necesita inversión)")
-        return 'invert_colors'
-
-    # Por defecto: texto oscuro sobre fondo claro (estándar OCR)
-    logger.info("Estrategia: black_on_white (por defecto)")
-    return 'black_on_white'
-
-
-def apply_smart_conversion(img: np.ndarray, strategy: str, analysis: dict) -> np.ndarray:
-    """
-    Aplica la estrategia de conversión decidida.
-    """
-    result = img.copy()
-
-    if strategy == 'red_background_advanced':
-        # NUEVA ESTRATEGIA: Pipeline optimizado para fondo rojo + texto blanco borroso
-        result = extract_white_text_from_red_bg_advanced(result)
-        logger.info("Aplicado: red_background_advanced (pipeline LAB+HSV optimizado)")
-
-    elif strategy == 'enhance_contrast':
-        # Aumentar contraste agresivamente
-        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
-        clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        # Binarización adaptativa
-        result = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8
-        )
-        logger.info("Aplicado: enhance_contrast con CLAHE + adaptive threshold")
-
-    elif strategy == 'extract_luminosity':
-        # Extraer canal de luminosidad (ignora color)
-        if len(result.shape) == 3:
-            lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
-            l_channel, _, _ = cv2.split(lab)
-            # Aplicar CLAHE al canal L
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-            enhanced_l = clahe.apply(l_channel)
-            # Binarización
-            _, result = cv2.threshold(enhanced_l, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            # Decidir si invertir basado en luminosidad del texto
-            if analysis['text_luminosity'] > 0.6:
-                result = cv2.bitwise_not(result)
-            logger.info("Aplicado: extract_luminosity (canal L de LAB)")
+        # Check if top_heavy clearly favors one orientation
+        if best_top_heavy > 0.55:  # Strong top-heavy signal (above neutral 0.5)
+            final_deg = best_by_top_heavy
+            should_rotate = (best_by_top_heavy != 0)
+            logger.info(
+                "Auto-rotation: Multiple orientations close (tolerance=%.5f). Using top-heavy to choose %d° (top_heavy=%.5f).",
+                tolerance, final_deg, best_top_heavy
+            )
         else:
-            result = adaptive_binarize(result)
+            # Top-heavy not decisive, try text orientation
+            best_text_orient = -1.0
+            best_by_text = 0
 
-    elif strategy == 'white_on_black':
-        # Convertir a escala de grises
-        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
-        # Invertir para que texto oscuro sobre fondo claro
-        inverted = cv2.bitwise_not(gray)
-        # Binarización Otsu
-        _, binary = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Volver a invertir para texto claro sobre fondo oscuro -> texto oscuro sobre fondo claro
-        result = cv2.bitwise_not(binary)
-        logger.info("Aplicado: white_on_black (invertir + Otsu + invertir)")
+            for deg in close_scores:
+                text_orient = candidates[deg].get("text_orientation", 0.0)
+                if text_orient > best_text_orient:
+                    best_text_orient = text_orient
+                    best_by_text = deg
 
-    elif strategy == 'black_on_white':
-        # Texto oscuro sobre fondo claro - solo binarizar
-        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
-        _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        logger.info("Aplicado: black_on_white (Otsu directo)")
+            # Check if text orientation clearly favors one orientation
+            if best_text_orient > 0.1:  # At least some text orientation signal
+                final_deg = best_by_text
+                should_rotate = (best_by_text != 0)
+                logger.info(
+                    "Auto-rotation: Multiple orientations close (tolerance=%.5f). Using text orientation to choose %d° (txt_score=%.5f).",
+                    tolerance, final_deg, best_text_orient
+                )
+            else:
+                # Neither top-heavy nor text orientation helpful, use the best total score
+                # But if best is not 0°, always rotate
+                final_deg = best_deg
+                should_rotate = (best_deg != 0)
+                if should_rotate:
+                    logger.info(
+                        "Auto-rotation: Multiple orientations close. Best score is %d° (%.5f). Rotating.",
+                        final_deg, best_score
+                    )
+    elif best_deg != 0:
+        # No tie, best is clearly different from 0°
+        # ALWAYS rotate if best is not 0° - be very aggressive
+        # Case 1: Best is 90° or 270° - ALWAYS rotate
+        if best_deg in [90, 270]:
+            should_rotate = True
+            logger.info(
+                "Auto-rotation: 90°/270° orientation detected (%d°, score=%.5f vs 0°=%.5f). Rotating.",
+                best_deg, best_score, base_score
+            )
+        # Case 2: Best is 180° - rotate if improvement is positive or scores are very close
+        elif best_deg == 180:
+            if improvement > 0 or abs(best_score - base_score) < tolerance:
+                should_rotate = True
+                logger.info(
+                    "Auto-rotation: 180° orientation detected (score=%.5f vs 0°=%.5f). Rotating.",
+                    best_score, base_score
+                )
+        # Case 3: Any improvement - rotate
+        elif improvement > 0:
+            should_rotate = True
+            logger.info(
+                "Auto-rotation: positive improvement detected (%d°, improve=%.2f%%). Rotating.",
+                final_deg, improvement * 100.0
+            )
+        # Case 4: Scores are very close but best is not 0° - still rotate
+        elif abs(best_score - base_score) < tolerance * 2:
+            should_rotate = True
+            logger.info(
+                "Auto-rotation: Scores close but best is %d° (%.5f vs 0°=%.5f). Rotating.",
+                best_deg, best_score, base_score
+            )
+    
+    if not should_rotate:
+        logger.info(
+            "Auto-rotation: No rotation needed (best=%d score=%.5f vs base=%.5f, improve=%.1f%%). Keeping 0°.",
+            best_deg, best_score, base_score, improvement * 100.0
+        )
+        final_deg = 0
+    
+    best_deg = final_deg
 
-    elif strategy == 'invert_colors':
-        # Invertir todo
-        result = cv2.bitwise_not(result)
-        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if len(result.shape) == 3 else result
-        _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        logger.info("Aplicado: invert_colors")
-
-    return result
-
-
-# ============================================
-# PIPELINE PRINCIPAL
-# ============================================
-
-def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tuple[np.ndarray, dict]:
-    """
-    Pipeline optimizado para tablas nutricionales.
-
-    Returns:
-        tuple: (imagen_procesada, metadata) donde metadata contiene:
-            - applied_operations: lista de operaciones aplicadas
-            - smart_analysis_used: bool
-            - strategy: estrategia usada (si smart_analysis_used=True)
-            - color_analysis: análisis de colores (si smart_analysis_used=True)
-    """
-    if options is None:
-        options = {}
-
-    result = img.copy()
-    applied = []
-    metadata = {
-        'applied_operations': [],
-        'smart_analysis_used': False,
+    out = _rotate_90s(img, best_deg)
+    meta: Dict = {
+        "auto_rotation_applied": best_deg != 0,
+        "rotation_degrees": best_deg,
+        "scores": {k: v for k, v in candidates.items()},
+        "improvement_ratio": improvement,
+        "deskew_applied": False,
+        "deskew_angle_deg": 0.0,
     }
 
-    # NUEVO: Análisis inteligente de color para tablas
-    if options.get('smart_table_analysis', True):
-        logger.info("=== ANÁLISIS INTELIGENTE DE TABLAS ACTIVADO ===")
-        metadata['smart_analysis_used'] = True
+    # Optional small-angle deskew after coarse rotation
+    if enable_deskew:
+        gray = _to_gray(out)
+        angle = _estimate_small_skew_angle(gray, max_abs_deg=deskew_max_abs_deg)
 
-        # Rotación inicial si es necesario
-        if options.get('rotate_180', False):
-            result = cv2.rotate(result, cv2.ROTATE_180)
-            applied.append('rotate_180')
+        # We want to counter the skew => rotate by -angle
+        if abs(angle) >= 0.3:
+            out = _rotate_arbitrary(out, -angle)
+            meta["deskew_applied"] = True
+            meta["deskew_angle_deg"] = float(angle)
+            logger.info("Deskew applied: %.2f° (rotated by %.2f°)", angle, -angle)
 
-        # Upscale inicial si es necesario
-        h, w = result.shape[:2]
-        min_size = options.get('min_size', 800)
-        max_scale = options.get('max_scale', 3.0)
-        upscale_method = options.get('upscale_method', 'cubic')
-        if options.get('upscale', True) and (h < min_size or w < min_size):
-            scale = min(max(min_size / min(h, w), 1.5), max_scale)
-            result = upscale_image(result, scale, upscale_method)
-            applied.append(f'upscale_{scale:.1f}x_{upscale_method}')
+    logger.info("Auto-rotation result: %d° (deskew=%s)", meta["rotation_degrees"], meta["deskew_applied"])
+    return out, meta
 
-        # NUEVO: Deblurring ANTES de conversión (clave para texto pequeño)
-        if options.get('deblur', False):
-            deblur_method = options.get('deblur_method', 'unsharp')
-            deblur_strength = options.get('deblur_strength', 1.0)
-            result = deblur_image(result, deblur_method, deblur_strength)
-            applied.append(f'deblur_{deblur_method}_{deblur_strength}')
-            logger.info("Aplicado deblurring con método: %s, strength: %.1f", deblur_method, deblur_strength)
 
-        # Detectar regiones de tabla
-        regions = detect_table_regions(result)
-        metadata['detected_regions'] = len(regions)
+def preprocess_for_table_ocr(img: np.ndarray, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
+    """
+    Public entrypoint for table OCR preprocessing.
+    Uses Tesseract OSD for robust orientation detection, with manual algorithm as fallback.
 
-        # Analizar la región más grande (asumiendo que es la tabla principal)
-        largest_region = max(regions, key=lambda r: r[2] * r[3])
-        
-        # NUEVO: Auto-crop/zoom a la región de la tabla detectada
-        if options.get('auto_crop_table', True):
-            x, y, w, h = largest_region
-            # Solo hacer crop si la región no es casi toda la imagen
-            # Threshold configurable (default 0.95 = 95%)
-            crop_threshold = options.get('auto_crop_threshold', 0.95)
-            total_area = result.shape[0] * result.shape[1]
-            region_area = w * h
-            
-            if region_area < total_area * crop_threshold:
-                result = result[y:y+h, x:x+w]
-                logger.info("Auto-crop aplicado: región %dx%d desde (%d,%d)", w, h, x, y)
-                metadata['auto_crop_applied'] = True
-                metadata['crop_region'] = {'x': x, 'y': y, 'width': w, 'height': h}
-                applied.append(f'auto_crop_{w}x{h}')
-                
-                # Actualizar la región más grande a toda la imagen después del crop
-                largest_region = (0, 0, w, h)
-            else:
-                logger.info("Auto-crop omitido: región ocupa >%.0f%% de la imagen", crop_threshold * 100)
-                metadata['auto_crop_applied'] = False
-        else:
-            metadata['auto_crop_applied'] = False
+    options:
+      - enable_deskew: bool (default True) - Apply small-angle deskew correction
+      - deskew_max_abs_deg: float (default 8.0) - Maximum deskew angle
+      - min_improvement: float (default 0.0) - Minimum improvement for manual algorithm
+      - use_tesseract: bool (default True) - Use Tesseract OSD (recommended)
+    """
+    options = options or {}
 
-        # Analizar colores de texto y fondo
-        analysis = analyze_text_and_background_colors(result, largest_region)
+    # Extract rotation-specific options
+    enable_deskew = bool(options.get("enable_deskew", True))
+    deskew_max_abs_deg = float(options.get("deskew_max_abs_deg", 8.0))
+    min_improvement = float(options.get("min_improvement", 0.0))
+    use_tesseract = bool(options.get("use_tesseract", True))
 
-        # Decidir estrategia de conversión (o usar la forzada)
-        force_strategy = options.get('force_strategy')
-        if force_strategy:
-            strategy = force_strategy
-            metadata['strategy_forced'] = True
-            logger.info("Estrategia FORZADA por usuario: %s", strategy)
-        else:
-            strategy = decide_conversion_strategy(analysis)
-            metadata['strategy_forced'] = False
-
-        # Guardar en metadata
-        metadata['strategy'] = strategy
-        metadata['color_analysis'] = {
-            'text_color': analysis['text_color'],
-            'text_luminosity': round(analysis['text_luminosity'], 2),
-            'bg_color': analysis['bg_color'],
-            'bg_luminosity': round(analysis['bg_luminosity'], 2),
-            'contrast': round(analysis['contrast'], 2),
-        }
-
-        # Aplicar conversión inteligente
-        result = apply_smart_conversion(result, strategy, analysis)
-        applied.append(f'smart_conversion_{strategy}')
-
-        # Sharpening DESPUÉS de conversión (opcional, para texto pequeño)
-        if options.get('sharpen', False):
-            sharpen_strength = options.get('sharpen_strength', 1.0)
-            sharpen_method = options.get('sharpen_method', 'unsharp')
-            if len(result.shape) == 2:
-                # Imagen ya binarizada, aplicar sharpening suave
-                result = sharpen_image(result, sharpen_strength, sharpen_method)
-                applied.append(f'sharpen_{sharpen_method}_{sharpen_strength}')
-                logger.info("Aplicado sharpening post-conversión: %s, strength: %.1f", sharpen_method, sharpen_strength)
-
-        # Denoise ligero después de la conversión (solo si no es texto muy pequeño)
-        if not options.get('preserve_fine_details', False):
-            if len(result.shape) == 2:
-                result = cv2.medianBlur(result, 3)
-                applied.append('median_blur')
-
-        metadata['applied_operations'] = applied
-        logger.info("Pipeline inteligente completado: %s", applied)
-        return result, metadata
-
-    # FALLBACK: Pipeline clásico (si smart_table_analysis está desactivado)
+    # Apply auto-rotation (Tesseract OSD first, then manual fallback)
+    rotated_img, rotation_meta = auto_rotate_table_upright(
+        img,
+        enable_deskew=enable_deskew,
+        deskew_max_abs_deg=deskew_max_abs_deg,
+        min_improvement=min_improvement,
+        use_tesseract=use_tesseract,
+    )
     
-    # Auto-crop también disponible en pipeline clásico
-    if options.get('auto_crop_table', False):
-        regions = detect_table_regions(result)
-        if regions:
-            largest_region = max(regions, key=lambda r: r[2] * r[3])
-            x, y, w_crop, h_crop = largest_region
-            crop_threshold = options.get('auto_crop_threshold', 0.95)
-            total_area = result.shape[0] * result.shape[1]
-            region_area = w_crop * h_crop
-            
-            if region_area < total_area * crop_threshold:
-                result = result[y:y+h_crop, x:x+w_crop]
-                logger.info("Auto-crop aplicado (pipeline clásico): región %dx%d desde (%d,%d)", w_crop, h_crop, x, y)
-                metadata['auto_crop_applied'] = True
-                metadata['crop_region'] = {'x': x, 'y': y, 'width': w_crop, 'height': h_crop}
-                applied.append(f'auto_crop_{w_crop}x{h_crop}')
-            else:
-                metadata['auto_crop_applied'] = False
-        else:
-            metadata['auto_crop_applied'] = False
-    else:
-        metadata['auto_crop_applied'] = False
+    # Build metadata compatible with routes.py expectations
+    metadata = {
+        "applied_operations": [],
+        "rotation_metadata": rotation_meta,
+    }
     
-    if options.get('rotate_180', False):
-        result = cv2.rotate(result, cv2.ROTATE_180)
-        applied.append('rotate_180')
+    if rotation_meta["auto_rotation_applied"]:
+        metadata["applied_operations"].append(f"rotate_{rotation_meta['rotation_degrees']}")
+    
+    if rotation_meta["deskew_applied"]:
+        metadata["applied_operations"].append(f"deskew_{rotation_meta['deskew_angle_deg']:.2f}")
+    
+    return rotated_img, metadata
 
-    h, w = result.shape[:2]
-    min_size = options.get('min_size', 800)
-    max_scale = options.get('max_scale', 3.0)
-    if options.get('upscale', True) and (h < min_size or w < min_size):
-        scale = min(max(min_size / min(h, w), 1.5), max_scale)
-        result = upscale_image(result, scale)
-        applied.append(f'upscale_{scale:.1f}x')
 
-    # IMPORTANTE: Convertir a escala de grises ANTES de los filtros (si está activado)
-    # Esto evita que CLAHE blanquee la imagen a color
-    if options.get('convert_to_grayscale', False) and len(result.shape) == 3:
-        result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-        applied.append('convert_to_grayscale')
-        logger.info("Convertido a escala de grises ANTES de filtros")
+def preprocess(img: np.ndarray, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
+    """
+    Minimal public entrypoint (alias for compatibility):
+    - Only auto-rotation to keep the table upright.
 
-    if options.get('enhance_contrast', True):
-        tile_grid = tuple(options.get('clahe_tile_grid_size', [8, 8]))
-        result = enhance_contrast_clahe(result, options.get('clip_limit', 3.0), tile_grid)
-        applied.append(f'clahe_{options.get("clip_limit", 3.0)}')
-
-    # Solo procesar color si NO se convirtió a escala de grises
-    if not options.get('convert_to_grayscale', False):
-        if options.get('extract_white_text', False):
-            result = extract_text_from_colored_bg(result)
-            applied.append('extract_white_text')
-        elif options.get('extract_text_adaptive', False):
-            result = extract_text_adaptive(result)
-            applied.append('extract_text_adaptive')
-        elif options.get('remove_color_bg', True):
-            result = remove_color_background(result)
-            applied.append('remove_color_bg')
-
-    if options.get('deskew', True):
-        result = deskew_image(result)
-        applied.append('deskew')
-
-    # Deblur (antes de denoise para mejor resultado)
-    if options.get('deblur', False):
-        deblur_method = options.get('deblur_method', 'unsharp')
-        deblur_strength = options.get('deblur_strength', 1.0)
-        result = deblur_image(result, deblur_method, deblur_strength)
-        applied.append(f'deblur_{deblur_method}_{deblur_strength}')
-        logger.info("Aplicado deblurring: %s, strength: %.1f", deblur_method, deblur_strength)
-
-    if options.get('denoise', True):
-        denoise_method = options.get('denoise_method', 'bilateral')
-        if len(result.shape) == 2:
-            result = cv2.medianBlur(result, 3)
-        else:
-            d = options.get('bilateral_d', 9)
-            sigma_color = options.get('bilateral_sigma_color', 75)
-            sigma_space = options.get('bilateral_sigma_space', 75)
-            result = denoise_image(result, denoise_method, d, sigma_color, sigma_space)
-        applied.append(f'denoise_{denoise_method}')
-
-    if options.get('sharpen', False) and len(result.shape) == 3:
-        result = sharpen_image(result, options.get('sharpen_strength', 1.0))
-        applied.append('sharpen')
-
-    if options.get('binarize', False):
-        block_size = options.get('adaptive_block_size', 11)
-        C = options.get('adaptive_C', 2)
-        result = adaptive_binarize(result, options.get('binarize_method', 'otsu'), block_size, C)
-        applied.append(f'binarize_{options.get("binarize_method", "otsu")}')
-
-    # Morfología post-procesamiento
-    if options.get('post_morphology', False) and len(result.shape) == 2:
-        morph_mode = options.get('morphology_mode', 'open')
-        kernel_size = tuple(options.get('morphology_kernel', [2, 2]))
-        iterations = options.get('morphology_iterations', 1)
-        result = apply_morphology(result, morph_mode, kernel_size, iterations)
-        applied.append(f'morph_{morph_mode}')
-
-    if options.get('auto_invert', True):
-        result = invert_if_dark(result)
-
-    # Nota: convert_to_grayscale se movió al INICIO del pipeline (línea ~768)
-    # para que los filtros procesen la imagen gris desde el principio
-
-    metadata['applied_operations'] = applied
-    logger.info("Aplicado: %s", applied)
-    return result, metadata
+    options:
+      - enable_deskew: bool (default True)
+      - deskew_max_abs_deg: float (default 8.0)
+      - min_improvement: float (default 0.0) - Set to 0 for maximum rotation aggressiveness
+    """
+    return preprocess_for_table_ocr(img, options)

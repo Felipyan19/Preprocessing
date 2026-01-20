@@ -125,23 +125,3 @@ def encode_image_to_base64(img: np.ndarray, fmt: str = 'png') -> str:
     """Codifica imagen a base64."""
     _, buffer = cv2.imencode(f'.{fmt}', img)
     return base64.b64encode(buffer).decode('utf-8')
-
-
-def download_pdf_from_url(url: str) -> bytes:
-    """Descarga PDF desde URL."""
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    content = response.content
-    if not is_pdf(content) and not url.lower().endswith('.pdf'):
-        raise ValueError('El recurso no parece ser un PDF')
-    return content
-
-
-def decode_base64_pdf(base64_string: str) -> bytes:
-    """Decodifica PDF base64."""
-    if ',' in base64_string:
-        base64_string = base64_string.split(',')[1]
-    pdf_bytes = base64.b64decode(base64_string)
-    if not is_pdf(pdf_bytes):
-        raise ValueError('El contenido base64 no parece ser un PDF')
-    return pdf_bytes
