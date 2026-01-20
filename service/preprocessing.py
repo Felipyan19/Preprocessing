@@ -701,6 +701,30 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
 
         # Analizar la región más grande (asumiendo que es la tabla principal)
         largest_region = max(regions, key=lambda r: r[2] * r[3])
+        
+        # NUEVO: Auto-crop/zoom a la región de la tabla detectada
+        if options.get('auto_crop_table', True):
+            x, y, w, h = largest_region
+            # Solo hacer crop si la región no es casi toda la imagen
+            # Threshold configurable (default 0.95 = 95%)
+            crop_threshold = options.get('auto_crop_threshold', 0.95)
+            total_area = result.shape[0] * result.shape[1]
+            region_area = w * h
+            
+            if region_area < total_area * crop_threshold:
+                result = result[y:y+h, x:x+w]
+                logger.info("Auto-crop aplicado: región %dx%d desde (%d,%d)", w, h, x, y)
+                metadata['auto_crop_applied'] = True
+                metadata['crop_region'] = {'x': x, 'y': y, 'width': w, 'height': h}
+                applied.append(f'auto_crop_{w}x{h}')
+                
+                # Actualizar la región más grande a toda la imagen después del crop
+                largest_region = (0, 0, w, h)
+            else:
+                logger.info("Auto-crop omitido: región ocupa >%.0f%% de la imagen", crop_threshold * 100)
+                metadata['auto_crop_applied'] = False
+        else:
+            metadata['auto_crop_applied'] = False
 
         # Analizar colores de texto y fondo
         analysis = analyze_text_and_background_colors(result, largest_region)
@@ -750,6 +774,30 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         return result, metadata
 
     # FALLBACK: Pipeline clásico (si smart_table_analysis está desactivado)
+    
+    # Auto-crop también disponible en pipeline clásico
+    if options.get('auto_crop_table', False):
+        regions = detect_table_regions(result)
+        if regions:
+            largest_region = max(regions, key=lambda r: r[2] * r[3])
+            x, y, w_crop, h_crop = largest_region
+            crop_threshold = options.get('auto_crop_threshold', 0.95)
+            total_area = result.shape[0] * result.shape[1]
+            region_area = w_crop * h_crop
+            
+            if region_area < total_area * crop_threshold:
+                result = result[y:y+h_crop, x:x+w_crop]
+                logger.info("Auto-crop aplicado (pipeline clásico): región %dx%d desde (%d,%d)", w_crop, h_crop, x, y)
+                metadata['auto_crop_applied'] = True
+                metadata['crop_region'] = {'x': x, 'y': y, 'width': w_crop, 'height': h_crop}
+                applied.append(f'auto_crop_{w_crop}x{h_crop}')
+            else:
+                metadata['auto_crop_applied'] = False
+        else:
+            metadata['auto_crop_applied'] = False
+    else:
+        metadata['auto_crop_applied'] = False
+    
     if options.get('rotate_180', False):
         result = cv2.rotate(result, cv2.ROTATE_180)
         applied.append('rotate_180')
@@ -813,7 +861,7 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         result = sharpen_image(result, options.get('sharpen_strength', 1.0))
         applied.append('sharpen')
 
-    if options.get('binarize', False) and len(result.shape) == 3:
+    if options.get('binarize', False):
         block_size = options.get('adaptive_block_size', 11)
         C = options.get('adaptive_C', 2)
         result = adaptive_binarize(result, options.get('binarize_method', 'otsu'), block_size, C)
@@ -827,7 +875,7 @@ def preprocess_for_table_ocr(img: np.ndarray, options: dict | None = None) -> tu
         result = apply_morphology(result, morph_mode, kernel_size, iterations)
         applied.append(f'morph_{morph_mode}')
 
-    if options.get('auto_invert', True) and len(result.shape) == 3:
+    if options.get('auto_invert', True):
         result = invert_if_dark(result)
 
     # Nota: convert_to_grayscale se movió al INICIO del pipeline (línea ~768)

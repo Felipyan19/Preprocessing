@@ -42,10 +42,13 @@ def preprocess():
                                         #   - ocr_preserve_details (preserva detalles finos)
                                         #   - ocr_ultra_fine (CLAHE+bilateral+adaptive+morfología)
                                         #   - gemini_vision (NUEVO⭐: para Gemini/GPT-Vision/Claude)
+                                        #   - gemini_vision_rotated (igual pero rota 180° primero)
                                         #   - minimal
         
         # Opciones directas (sin anidación):
         "smart_table_analysis": true,
+        "auto_crop_table": true,  # NUEVO: Zoom automático a la región de la tabla detectada
+        "auto_crop_threshold": 0.95,  # Threshold para crop (0.85 = solo si región < 85%, más conservador)
         "force_strategy": "red_background_advanced",  # Estrategias: white_on_black, black_on_white,
                                                       # enhance_contrast, extract_luminosity, 
                                                       # red_background_advanced (NUEVO), invert_colors
@@ -140,6 +143,7 @@ def preprocess():
                 # NUEVO: Preset óptimo para tablas con fondo rojo y texto blanco borroso
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'force_strategy': 'red_background_advanced',
                     'upscale': True,
                     'min_size': 1000,
@@ -151,6 +155,7 @@ def preprocess():
                 # Análisis inteligente automático (sin forzar estrategia)
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'upscale': True,
                     'min_size': 1000,
                     'max_scale': 3.0,
@@ -162,6 +167,7 @@ def preprocess():
                 # ADVERTENCIA: Puede engrosar trazos y perder detalles finos para OCR
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'upscale': True,
                     'min_size': 2000,
                     'max_scale': 5.0,
@@ -180,6 +186,7 @@ def preprocess():
                 # Menos procesamiento = menos distorsión
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'upscale': True,
                     'min_size': 1800,
                     'max_scale': 4.0,
@@ -226,35 +233,65 @@ def preprocess():
                     'auto_invert': False,
                 }
             elif preset == 'gemini_vision':
-                # Base: Escala de grises + filtros MUY suaves para nitidez
-                # Optimizado para Gemini 2.5 Pro (mantiene naturalidad)
+                # SIMPLE: Solo escala de grises + contraste + rotación/inversión automática
+                # Optimizado para Gemini 2.5 Pro (mantiene imagen natural)
                 options = {
-                    'smart_table_analysis': False,  # Sin análisis automático
+                    'smart_table_analysis': False,  # Sin análisis automático de estrategias
+                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
+                    'auto_crop_threshold': 0.85,  # (solo si se activa manualmente)
+                    'rotate_180': False,  # Cambiar a true si la imagen está al revés
                     'upscale': True,
-                    'min_size': 2000,
+                    'min_size': 1800,  # Un poco más grande para mejor legibilidad
                     'max_scale': 3.0,
                     'upscale_method': 'lanczos4',
                     # Convertir a escala de grises (rojo → gris)
                     'convert_to_grayscale': True,
-                    # CLAHE MUY suave (solo mejorar contraste de números finos)
+                    # CLAHE para buen contraste
                     'enhance_contrast': True,
-                    'clip_limit': 1.5,  # Suave
+                    'clip_limit': 3.0,  # Un poco más de contraste
                     'clahe_tile_grid_size': [8, 8],
-                    # Deblur ultra-suave (ayuda con 7,2 vs 7,1)
+                    # Deblur MUY suave para texto pequeño
                     'deblur': True,
                     'deblur_method': 'unsharp',
-                    'deblur_strength': 0.3,  # Ultra-suave
-                    # Resto DESACTIVADO
+                    'deblur_strength': 0.4,
+                    # TODO LO DEMÁS DESACTIVADO (imagen natural)
+                    'denoise': False,
+                    'remove_color_bg': False,
+                    'sharpen': False,
+                    'binarize': False,  # SIN BINARIZAR
+                    'post_morphology': False,
+                    'deskew': False,
+                    'auto_invert': True,  # ACTIVADO: invierte automáticamente si fondo es oscuro
+                    'extract_white_text': False,
+                    'extract_text_adaptive': False,
+                }
+            elif preset == 'gemini_vision_rotated':
+                # Igual a gemini_vision pero ROTA 180° primero (para imágenes al revés)
+                options = {
+                    'smart_table_analysis': False,
+                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
+                    'auto_crop_threshold': 0.85,
+                    'rotate_180': True,  # ROTACIÓN 180°
+                    'upscale': True,
+                    'min_size': 1800,
+                    'max_scale': 3.0,
+                    'upscale_method': 'lanczos4',
+                    'convert_to_grayscale': True,
+                    'enhance_contrast': True,
+                    'clip_limit': 3.0,
+                    'clahe_tile_grid_size': [8, 8],
+                    'deblur': True,
+                    'deblur_method': 'unsharp',
+                    'deblur_strength': 0.4,
                     'denoise': False,
                     'remove_color_bg': False,
                     'sharpen': False,
                     'binarize': False,
                     'post_morphology': False,
                     'deskew': False,
-                    'auto_invert': False,
+                    'auto_invert': True,
                     'extract_white_text': False,
                     'extract_text_adaptive': False,
-                    'preserve_fine_details': True,
                 }
             elif preset == 'minimal':
                 options = {
@@ -414,6 +451,7 @@ def preprocess_image():
             elif preset == 'red_table_blurry':
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'force_strategy': 'red_background_advanced',
                     'upscale': True,
                     'min_size': 1000,
@@ -424,6 +462,7 @@ def preprocess_image():
             elif preset == 'smart_auto':
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'upscale': True,
                     'min_size': 1000,
                     'max_scale': 3.0,
@@ -435,6 +474,7 @@ def preprocess_image():
                 # ADVERTENCIA: Puede engrosar trazos y perder detalles finos para OCR
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'upscale': True,
                     'min_size': 2000,
                     'max_scale': 5.0,
@@ -453,6 +493,7 @@ def preprocess_image():
                 # Menos procesamiento = menos distorsión
                 options = {
                     'smart_table_analysis': True,
+                    'auto_crop_table': True,
                     'upscale': True,
                     'min_size': 1800,
                     'max_scale': 4.0,
@@ -497,35 +538,65 @@ def preprocess_image():
                     'auto_invert': False,
                 }
             elif preset == 'gemini_vision':
-                # Base: Escala de grises + filtros MUY suaves para nitidez
-                # Optimizado para Gemini 2.5 Pro (mantiene naturalidad)
+                # SIMPLE: Solo escala de grises + contraste + rotación/inversión automática
+                # Optimizado para Gemini 2.5 Pro (mantiene imagen natural)
                 options = {
-                    'smart_table_analysis': False,  # Sin análisis automático
+                    'smart_table_analysis': False,  # Sin análisis automático de estrategias
+                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
+                    'auto_crop_threshold': 0.85,  # (solo si se activa manualmente)
+                    'rotate_180': False,  # Cambiar a true si la imagen está al revés
                     'upscale': True,
-                    'min_size': 2000,
+                    'min_size': 1800,  # Un poco más grande para mejor legibilidad
                     'max_scale': 3.0,
                     'upscale_method': 'lanczos4',
                     # Convertir a escala de grises (rojo → gris)
                     'convert_to_grayscale': True,
-                    # CLAHE MUY suave (solo mejorar contraste de números finos)
+                    # CLAHE para buen contraste
                     'enhance_contrast': True,
-                    'clip_limit': 1.5,  # Suave
+                    'clip_limit': 3.0,  # Un poco más de contraste
                     'clahe_tile_grid_size': [8, 8],
-                    # Deblur ultra-suave (ayuda con 7,2 vs 7,1)
+                    # Deblur MUY suave para texto pequeño
                     'deblur': True,
                     'deblur_method': 'unsharp',
-                    'deblur_strength': 0.3,  # Ultra-suave
-                    # Resto DESACTIVADO
+                    'deblur_strength': 0.4,
+                    # TODO LO DEMÁS DESACTIVADO (imagen natural)
+                    'denoise': False,
+                    'remove_color_bg': False,
+                    'sharpen': False,
+                    'binarize': False,  # SIN BINARIZAR
+                    'post_morphology': False,
+                    'deskew': False,
+                    'auto_invert': True,  # ACTIVADO: invierte automáticamente si fondo es oscuro
+                    'extract_white_text': False,
+                    'extract_text_adaptive': False,
+                }
+            elif preset == 'gemini_vision_rotated':
+                # Igual a gemini_vision pero ROTA 180° primero (para imágenes al revés)
+                options = {
+                    'smart_table_analysis': False,
+                    'auto_crop_table': False,  # SIN ZOOM (imagen completa)
+                    'auto_crop_threshold': 0.85,
+                    'rotate_180': True,  # ROTACIÓN 180°
+                    'upscale': True,
+                    'min_size': 1800,
+                    'max_scale': 3.0,
+                    'upscale_method': 'lanczos4',
+                    'convert_to_grayscale': True,
+                    'enhance_contrast': True,
+                    'clip_limit': 3.0,
+                    'clahe_tile_grid_size': [8, 8],
+                    'deblur': True,
+                    'deblur_method': 'unsharp',
+                    'deblur_strength': 0.4,
                     'denoise': False,
                     'remove_color_bg': False,
                     'sharpen': False,
                     'binarize': False,
                     'post_morphology': False,
                     'deskew': False,
-                    'auto_invert': False,
+                    'auto_invert': True,
                     'extract_white_text': False,
                     'extract_text_adaptive': False,
-                    'preserve_fine_details': True,
                 }
             elif preset == 'minimal':
                 options = {
