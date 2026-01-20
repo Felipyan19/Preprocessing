@@ -96,7 +96,8 @@ def preprocess():
                 options = {
                     'upscale': True,
                     'enhance_contrast': True,
-                    'remove_color_bg': True,
+                    'convert_to_grayscale': True,
+                    'remove_color_bg': False,
                     'deskew': True,
                     'denoise': True,
                     'sharpen': False,
@@ -224,6 +225,37 @@ def preprocess():
                     'deskew': False,
                     'auto_invert': False,
                 }
+            elif preset == 'gemini_vision':
+                # Base: Escala de grises + filtros MUY suaves para nitidez
+                # Optimizado para Gemini 2.5 Pro (mantiene naturalidad)
+                options = {
+                    'smart_table_analysis': False,  # Sin análisis automático
+                    'upscale': True,
+                    'min_size': 2000,
+                    'max_scale': 3.0,
+                    'upscale_method': 'lanczos4',
+                    # Convertir a escala de grises (rojo → gris)
+                    'convert_to_grayscale': True,
+                    # CLAHE MUY suave (solo mejorar contraste de números finos)
+                    'enhance_contrast': True,
+                    'clip_limit': 1.5,  # Suave
+                    'clahe_tile_grid_size': [8, 8],
+                    # Deblur ultra-suave (ayuda con 7,2 vs 7,1)
+                    'deblur': True,
+                    'deblur_method': 'unsharp',
+                    'deblur_strength': 0.3,  # Ultra-suave
+                    # Resto DESACTIVADO
+                    'denoise': False,
+                    'remove_color_bg': False,
+                    'sharpen': False,
+                    'binarize': False,
+                    'post_morphology': False,
+                    'deskew': False,
+                    'auto_invert': False,
+                    'extract_white_text': False,
+                    'extract_text_adaptive': False,
+                    'preserve_fine_details': True,
+                }
             elif preset == 'minimal':
                 options = {
                     'upscale': False,
@@ -339,7 +371,8 @@ def preprocess_image():
                 options = {
                     'upscale': True,
                     'enhance_contrast': True,
-                    'remove_color_bg': True,
+                    'convert_to_grayscale': True,
+                    'remove_color_bg': False,
                     'deskew': True,
                     'denoise': True,
                     'sharpen': False,
