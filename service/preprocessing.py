@@ -749,16 +749,385 @@ def auto_rotate_table_upright(
     return out, meta
 
 
+def _enhance_table_structure(img: np.ndarray, enhance_edges: bool = True, enhance_contrast: bool = True, aggressive: bool = False) -> np.ndarray:
+    """
+    Enhance table structure for better detection by Azure Vision.
+    
+    Args:
+        img: Input image
+        enhance_edges: Enhance table borders/lines
+        enhance_contrast: Improve contrast for better structure visibility
+        aggressive: Use more aggressive edge enhancement (thicker lines)
+    
+    Returns:
+        Enhanced image
+    """
+    # Convert to grayscale if needed (better for table detection)
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+    
+    if enhance_contrast:
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        # This improves contrast without over-amplifying noise
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+    
+    if enhance_edges:
+        # More aggressive edge enhancement for table detection
+        if aggressive:
+            # Use larger kernel for more visible borders
+            kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (gray.shape[1] // 20, 1))
+            kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, gray.shape[0] // 20))
+            
+            # Detect horizontal and vertical lines
+            horizontal = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel_h, iterations=2)
+            vertical = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel_v, iterations=2)
+            
+            # Combine horizontal and vertical lines
+            table_structure = cv2.addWeighted(horizontal, 0.5, vertical, 0.5, 0.0)
+            
+            # Enhance the original image with detected structure
+            gray = cv2.addWeighted(gray, 0.7, table_structure, 0.3, 0.0)
+            
+            # Apply additional sharpening to make borders crisp
+            kernel_sharpen = np.array([[-1, -1, -1],
+                                      [-1,  9, -1],
+                                      [-1, -1, -1]])
+            gray = cv2.filter2D(gray, -1, kernel_sharpen)
+        else:
+            # Lighter enhancement - detect and strengthen existing lines
+            # Use Canny edge detection to find edges
+            edges = cv2.Canny(gray, 50, 150)
+            
+            # Dilate edges to make them thicker
+            kernel = np.ones((2, 2), np.uint8)
+            edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+            
+            # Combine with original to strengthen borders
+            gray = cv2.addWeighted(gray, 0.9, edges_dilated, 0.1, 0.0)
+            
+            # Light morphological operations
+            kernel = np.ones((2, 2), np.uint8)
+            gray = cv2.dilate(gray, kernel, iterations=1)
+            gray = cv2.erode(gray, kernel, iterations=1)
+    
+    # Convert back to BGR if original was color
+    if len(img.shape) == 3:
+        result = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    else:
+        result = gray
+    
+    return result
+
+
+def _detect_and_rotate_table_region(img: np.ndarray) -> np.ndarray:
+    """
+    Detecta regiones con estructura tabular rotadas y las rota para dejarlas horizontales.
+    Busca regiones con texto alineado verticalmente (rotadas 90°).
+    Usa análisis de proyección para detectar regiones con estructura tabular vertical.
+    
+    Args:
+        img: Input image
+    
+    Returns:
+        Image with detected table regions rotated
+    """
+    # Convert to grayscale
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    
+    h, w = gray.shape[:2]
+    result = img.copy()
+    
+    try:
+        # Binarize image for better text detection
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Analyze vertical projection to find regions with vertical text structure
+        # Vertical projection: sum of pixels per column
+        vertical_projection = np.sum(binary, axis=0)
+        
+        # Find regions with high vertical density (potential vertical text columns)
+        threshold = np.mean(vertical_projection) * 1.5
+        vertical_mask = vertical_projection > threshold
+        
+        # Find contiguous regions
+        vertical_regions = []
+        in_region = False
+        start = 0
+        
+        for i in range(len(vertical_mask)):
+            if vertical_mask[i] and not in_region:
+                start = i
+                in_region = True
+            elif not vertical_mask[i] and in_region:
+                end = i
+                if end - start > w * 0.05:  # At least 5% of image width
+                    vertical_regions.append((start, end))
+                in_region = False
+        
+        if in_region:
+            end = len(vertical_mask)
+            if end - start > w * 0.05:
+                vertical_regions.append((start, end))
+        
+        # Now analyze horizontal projection for each vertical region
+        for x_start, x_end in vertical_regions:
+            region_width = x_end - x_start
+            region_binary = binary[:, x_start:x_end]
+            
+            # Horizontal projection for this region
+            horizontal_projection = np.sum(region_binary, axis=1)
+            
+            # Find vertical extent of text in this region
+            h_threshold = np.mean(horizontal_projection) * 1.2
+            h_mask = horizontal_projection > h_threshold
+            
+            # Find vertical bounds
+            y_indices = np.where(h_mask)[0]
+            if len(y_indices) > h * 0.1:  # At least 10% of image height
+                y_start = max(0, y_indices[0] - 20)
+                y_end = min(h, y_indices[-1] + 20)
+                region_height = y_end - y_start
+                
+                # Check if this region has vertical text characteristics
+                # (height > width suggests vertical text)
+                if region_height > region_width * 1.2:
+                    # Extract region
+                    region = img[y_start:y_end, x_start:x_end].copy()
+                    
+                    # Rotate 90° counter-clockwise
+                    rotated_region = cv2.rotate(region, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    
+                    # Calculate new position after rotation
+                    # After 90° CCW: (x, y, w, h) -> (x, y, h, w)
+                    new_width = region_height
+                    new_height = region_width
+                    
+                    # Center the rotated region
+                    center_x = x_start + region_width // 2
+                    center_y = y_start + region_height // 2
+                    
+                    new_x_start = max(0, center_x - new_width // 2)
+                    new_y_start = max(0, center_y - new_height // 2)
+                    new_x_end = min(w, new_x_start + new_width)
+                    new_y_end = min(h, new_y_start + new_height)
+                    
+                    # Adjust if out of bounds
+                    if new_x_end > w:
+                        new_x_start = w - new_width
+                    if new_y_end > h:
+                        new_y_start = h - new_height
+                    
+                    # Resize rotated region if needed
+                    if rotated_region.shape[1] != (new_x_end - new_x_start) or rotated_region.shape[0] != (new_y_end - new_y_start):
+                        rotated_region = cv2.resize(rotated_region, (new_x_end - new_x_start, new_y_end - new_y_start), interpolation=cv2.INTER_CUBIC)
+                    
+                    # Place rotated region
+                    if new_x_start >= 0 and new_y_start >= 0 and new_x_end <= w and new_y_end <= h:
+                        result[new_y_start:new_y_end, new_x_start:new_x_end] = rotated_region
+                        logger.info("Región de tabla rotada detectada y corregida: (%d,%d)-(%d,%d) -> (%d,%d)-(%d,%d)", 
+                                  x_start, y_start, x_end, y_end, new_x_start, new_y_start, new_x_end, new_y_end)
+    
+    except Exception as e:
+        logger.warning("Error al detectar y rotar región de tabla: %s", e)
+    
+    return result
+
+
+def _draw_table_borders(img: np.ndarray) -> np.ndarray:
+    """
+    Detecta la estructura de una tabla y dibuja bordes explícitos para que Azure Vision la reconozca.
+    Usa análisis de proyecciones para detectar filas y columnas, luego dibuja líneas.
+    
+    Args:
+        img: Input image
+    
+    Returns:
+        Image with explicit table borders drawn
+    """
+    # Convert to grayscale
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
+        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    
+    h, w = gray.shape[:2]
+    result = img.copy()
+    
+    try:
+        # Binarize image
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Horizontal projection: detect rows
+        h_projection = np.sum(binary, axis=1)
+        h_mean = np.mean(h_projection)
+        h_threshold = h_mean * 0.3  # Lower threshold to catch more rows
+        
+        # Find row boundaries (peaks in horizontal projection)
+        row_boundaries = []
+        in_row = False
+        row_start = 0
+        
+        for i in range(len(h_projection)):
+            if h_projection[i] > h_threshold and not in_row:
+                row_start = i
+                in_row = True
+            elif h_projection[i] <= h_threshold and in_row:
+                row_end = i
+                row_center = (row_start + row_end) // 2
+                row_boundaries.append(row_center)
+                in_row = False
+        
+        if in_row:
+            row_center = (row_start + len(h_projection)) // 2
+            row_boundaries.append(row_center)
+        
+        # Vertical projection: detect columns
+        v_projection = np.sum(binary, axis=0)
+        v_mean = np.mean(v_projection)
+        v_threshold = v_mean * 0.3  # Lower threshold to catch more columns
+        
+        # Find column boundaries (peaks in vertical projection)
+        col_boundaries = []
+        in_col = False
+        col_start = 0
+        
+        for i in range(len(v_projection)):
+            if v_projection[i] > v_threshold and not in_col:
+                col_start = i
+                in_col = True
+            elif v_projection[i] <= v_threshold and in_col:
+                col_end = i
+                col_center = (col_start + col_end) // 2
+                col_boundaries.append(col_center)
+                in_col = False
+        
+        if in_col:
+            col_center = (col_start + len(v_projection)) // 2
+            col_boundaries.append(col_center)
+        
+        # Filter boundaries: keep only significant ones
+        # Remove boundaries that are too close together
+        min_row_spacing = h * 0.02  # At least 2% of image height
+        min_col_spacing = w * 0.02  # At least 2% of image width
+        
+        filtered_rows = []
+        if len(row_boundaries) > 0:
+            filtered_rows.append(row_boundaries[0])
+            for r in row_boundaries[1:]:
+                if r - filtered_rows[-1] > min_row_spacing:
+                    filtered_rows.append(r)
+        
+        filtered_cols = []
+        if len(col_boundaries) > 0:
+            filtered_cols.append(col_boundaries[0])
+            for c in col_boundaries[1:]:
+                if c - filtered_cols[-1] > min_col_spacing:
+                    filtered_cols.append(c)
+        
+        # Need at least 2 rows and 2 columns to form a table
+        if len(filtered_rows) >= 2 and len(filtered_cols) >= 2:
+            # Draw horizontal lines (row separators)
+            line_thickness = max(2, int(min(h, w) * 0.001))  # Thickness based on image size
+            line_color = (0, 0, 0)  # Black lines
+            
+            for row_y in filtered_rows:
+                cv2.line(result, (0, row_y), (w, row_y), line_color, line_thickness)
+            
+            # Draw vertical lines (column separators)
+            for col_x in filtered_cols:
+                cv2.line(result, (col_x, 0), (col_x, h), line_color, line_thickness)
+            
+            # Draw outer border
+            border_thickness = line_thickness * 2
+            # Top border
+            top_row = min(filtered_rows)
+            cv2.line(result, (0, top_row), (w, top_row), line_color, border_thickness)
+            # Bottom border
+            bottom_row = max(filtered_rows)
+            cv2.line(result, (0, bottom_row), (w, bottom_row), line_color, border_thickness)
+            # Left border
+            left_col = min(filtered_cols)
+            cv2.line(result, (left_col, 0), (left_col, h), line_color, border_thickness)
+            # Right border
+            right_col = max(filtered_cols)
+            cv2.line(result, (right_col, 0), (right_col, h), line_color, border_thickness)
+            
+            logger.info("Bordes de tabla dibujados: %d filas, %d columnas", len(filtered_rows), len(filtered_cols))
+        else:
+            logger.warning("No se detectó estructura de tabla suficiente (filas: %d, columnas: %d)", len(filtered_rows), len(filtered_cols))
+    
+    except Exception as e:
+        logger.error("Error al dibujar bordes de tabla: %s", e)
+    
+    return result
+
+
+def _upscale_image(img: np.ndarray, target_width: Optional[int] = None, target_height: Optional[int] = None, scale_factor: Optional[float] = None) -> np.ndarray:
+    """
+    Upscale image for better table detection.
+    
+    Args:
+        img: Input image
+        target_width: Target width in pixels
+        target_height: Target height in pixels
+        scale_factor: Scale factor (e.g., 2.0 for 2x)
+    
+    Returns:
+        Upscaled image
+    """
+    h, w = img.shape[:2]
+    
+    if scale_factor is not None:
+        new_w = int(w * scale_factor)
+        new_h = int(h * scale_factor)
+    elif target_width is not None and target_height is not None:
+        new_w = target_width
+        new_h = target_height
+    elif target_width is not None:
+        scale = target_width / w
+        new_w = target_width
+        new_h = int(h * scale)
+    elif target_height is not None:
+        scale = target_height / h
+        new_w = int(w * scale)
+        new_h = target_height
+    else:
+        return img
+    
+    # Use INTER_CUBIC for better quality when upscaling
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+
 def preprocess_for_table_ocr(img: np.ndarray, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
     """
     Public entrypoint for table OCR preprocessing.
     Uses Tesseract OSD for robust orientation detection, with manual algorithm as fallback.
+    Now includes options for Azure Vision table detection enhancement.
 
     options:
       - enable_deskew: bool (default True) - Apply small-angle deskew correction
       - deskew_max_abs_deg: float (default 8.0) - Maximum deskew angle
       - min_improvement: float (default 0.0) - Minimum improvement for manual algorithm
       - use_tesseract: bool (default True) - Use Tesseract OSD (recommended)
+      - enhance_table_structure: bool (default False) - Enhance table borders for Azure Vision
+      - enhance_edges: bool (default True) - Enhance table edges (only if enhance_table_structure=True)
+      - enhance_contrast: bool (default True) - Enhance contrast (only if enhance_table_structure=True)
+      - aggressive_enhancement: bool (default False) - Use aggressive edge enhancement (thicker, more visible borders)
+      - detect_rotated_tables: bool (default False) - Detect and rotate table regions that are rotated 90° within the image
+      - draw_table_borders: bool (default False) - Detect table structure and draw explicit borders (recommended for Azure Vision)
+      - upscale: bool (default False) - Upscale image for better detection
+      - upscale_width: int (optional) - Target width for upscaling
+      - upscale_height: int (optional) - Target height for upscaling
+      - upscale_factor: float (optional) - Scale factor for upscaling (e.g., 2.0)
+      - grayscale: bool (default False) - Convert to grayscale (better for table detection)
     """
     options = options or {}
 
@@ -789,7 +1158,63 @@ def preprocess_for_table_ocr(img: np.ndarray, options: Optional[Dict] = None) ->
     if rotation_meta["deskew_applied"]:
         metadata["applied_operations"].append(f"deskew_{rotation_meta['deskew_angle_deg']:.2f}")
     
-    return rotated_img, metadata
+    processed = rotated_img
+    
+    # Log opciones recibidas para debugging
+    logger.debug("Opciones de preprocesamiento recibidas: %s", options)
+    
+    # Detect and rotate table regions that are rotated within the image
+    detect_rotated = options.get("detect_rotated_tables", False)
+    if detect_rotated:
+        processed = _detect_and_rotate_table_region(processed)
+        metadata["applied_operations"].append("detect_rotated_tables")
+        logger.info("Aplicada detección y rotación de regiones de tabla rotadas")
+    
+    # Apply grayscale conversion if requested (better for Azure Vision table detection)
+    grayscale_enabled = options.get("grayscale", False)
+    if grayscale_enabled:
+        if len(processed.shape) == 3:
+            processed = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+            processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)  # Keep as BGR for consistency
+            metadata["applied_operations"].append("grayscale")
+            logger.info("Aplicada conversión a escala de grises")
+    
+    # Draw explicit table borders (should be done before other enhancements for better detection)
+    draw_borders = options.get("draw_table_borders", False)
+    if draw_borders:
+        processed = _draw_table_borders(processed)
+        metadata["applied_operations"].append("draw_table_borders")
+        logger.info("Bordes de tabla dibujados explícitamente")
+    
+    # Apply table structure enhancement for Azure Vision
+    enhance_enabled = options.get("enhance_table_structure", False)
+    if enhance_enabled:
+        enhance_edges = options.get("enhance_edges", True)
+        enhance_contrast = options.get("enhance_contrast", True)
+        aggressive = options.get("aggressive_enhancement", False)
+        processed = _enhance_table_structure(processed, enhance_edges=enhance_edges, enhance_contrast=enhance_contrast, aggressive=aggressive)
+        op_name = "enhance_table_structure_aggressive" if aggressive else "enhance_table_structure"
+        metadata["applied_operations"].append(op_name)
+        logger.info("Aplicada mejora de estructura de tabla (edges=%s, contrast=%s, aggressive=%s)", enhance_edges, enhance_contrast, aggressive)
+    
+    # Apply upscaling if requested
+    upscale_enabled = options.get("upscale", False)
+    if upscale_enabled:
+        upscale_width = options.get("upscale_width")
+        upscale_height = options.get("upscale_height")
+        upscale_factor = options.get("upscale_factor")
+        
+        original_h, original_w = processed.shape[:2]
+        processed = _upscale_image(processed, target_width=upscale_width, target_height=upscale_height, scale_factor=upscale_factor)
+        new_h, new_w = processed.shape[:2]
+        
+        scale_info = f"upscale_{new_w}x{new_h}"
+        if upscale_factor:
+            scale_info = f"upscale_{upscale_factor:.1f}x"
+        metadata["applied_operations"].append(scale_info)
+        logger.info("Aplicado upscaling: %dx%d -> %dx%d", original_w, original_h, new_w, new_h)
+    
+    return processed, metadata
 
 
 def preprocess(img: np.ndarray, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:

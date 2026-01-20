@@ -184,7 +184,20 @@ def preprocess_image():
         # Opciones de rotación automática:
         "enable_deskew": true,          # Aplicar corrección de inclinación pequeña (default: true)
         "deskew_max_abs_deg": 8.0,      # Máximo ángulo de deskew en grados (default: 8.0)
-        "min_improvement": 0.0         # Mejora mínima requerida para aplicar rotación (default: 0.0 - máximo agresivo)
+        "min_improvement": 0.0,         # Mejora mínima requerida para aplicar rotación (default: 0.0 - máximo agresivo)
+        
+        # Opciones para mejorar detección de tablas (Azure Vision):
+        "enhance_table_structure": true, # Mejorar bordes y contraste de tablas (default: false) ⭐ RECOMENDADO PARA AZURE VISION
+        "enhance_edges": true,          # Mejorar bordes de tabla (default: true, solo si enhance_table_structure=true)
+        "enhance_contrast": true,        # Mejorar contraste (default: true, solo si enhance_table_structure=true)
+        "aggressive_enhancement": true,  # Mejora agresiva de bordes (default: false) - Hace bordes más gruesos y visibles
+        "detect_rotated_tables": true,  # Detectar y rotar regiones de tabla rotadas 90° dentro de la imagen (default: false) ⭐ IMPORTANTE
+        "draw_table_borders": true,     # Detectar estructura de tabla y dibujar bordes explícitos (default: false) ⭐⭐⭐ MUY RECOMENDADO PARA AZURE VISION
+        "grayscale": false,             # Convertir a escala de grises (default: false) - Mejora detección de tablas
+        "upscale": false,               # Aumentar resolución de imagen (default: false)
+        "upscale_factor": 2.0,          # Factor de escala (ej: 2.0 = 2x) (opcional)
+        "upscale_width": 6000,          # Ancho objetivo en píxeles (opcional)
+        "upscale_height": 8000           # Alto objetivo en píxeles (opcional)
     }
     
     Respuesta (si return_url=true):
@@ -226,7 +239,7 @@ def preprocess_image():
             return jsonify({'error': f'Formato no soportado: {output_format}. Use: png, jpg, jpeg, webp'}), 400
 
         # Claves especiales que no son opciones de procesamiento
-        special_keys = {'image_url', 'image_base64', 'preset', 'format'}
+        special_keys = {'image_url', 'image_base64', 'preset', 'format', 'dpi', 'return_url', 'expiry_seconds'}
 
         # Extraer opciones personalizadas del usuario
         user_options = {k: v for k, v in data.items() if k not in special_keys}
@@ -257,6 +270,9 @@ def preprocess_image():
 
         # Sobrescribir opciones del preset con las opciones personalizadas del usuario
         options.update(user_options)
+        
+        # Log de opciones para debugging
+        logger.info("Opciones de preprocesamiento: %s", options)
 
         # Procesar imagen
         processed, metadata = preprocess_for_table_ocr(img, options)
